@@ -1,11 +1,29 @@
 # atom-reconstruction-viewer
 
-原子像再構成から、原子間距離を自動出力するPythonツール
+## Overview
+
+This tool visualizes atom reconstruction data for materials analysis.
+It helps understand atomic distributions and structural features from experimental or simulation data.
+
+## Features
+
+* Load reconstruction data
+* Visualize atomic positions in 2D/3D
+* Simple data processing for analysis
 
 ## Usage
-python main.py input.txt
 
-## Requirements
-Python 3.x
-numpy
-matplotlib
+```bash
+python main.py input.txt
+```
+
+## Tech Stack
+
+* Python
+* NumPy
+* Matplotlib
+
+## Motivation
+
+Developed to support analysis in materials / semiconductor research.
+
