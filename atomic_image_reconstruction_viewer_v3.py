@@ -654,6 +654,79 @@ class PeakDetectionWorker(QThread):
         self.finished.emit(peaks)
 
 
+# =============================================================================
+# 強度プロファイルワーカー
+# =============================================================================
+class IntensityProfileWorker(QThread):
+    """アクティブ原子セットのサイト強度総和を Z フレーム全範囲でスキャンする。
+
+    weight_mode: 'flat'     … ディスク内一様積算
+                 'gaussian' … ガウシアン重み付き積算 (sigma_px = radius_ang / dx)
+    """
+    progress = pyqtSignal(int, int)   # (done, total)
+    finished = pyqtSignal(list)       # [(z_ang_float, intensity_sum_float), ...]
+
+    def __init__(self, volume, z_start_idx, z_end_idx, atom_positions_px,
+                 sample_radius_px, z_origin, dz,
+                 weight_mode='flat', sigma_px=None):
+        super().__init__()
+        self.volume = volume
+        self.z_start_idx = z_start_idx
+        self.z_end_idx = z_end_idx
+        self.atom_positions_px = atom_positions_px  # [(ix, iy), ...]
+        self.sample_radius_px = sample_radius_px
+        self.z_origin = z_origin
+        self.dz = dz
+        self.weight_mode = weight_mode
+        # ガウシアンモード時の σ (px)。未指定なら radius_px / 2 を使う
+        self.sigma_px = sigma_px if sigma_px is not None else max(1.0, sample_radius_px / 2.0)
+
+    def run(self):
+        nz, ny, nx = self.volume.shape
+        r = self.sample_radius_px
+        total = self.z_end_idx - self.z_start_idx
+        if total <= 0:
+            self.finished.emit([])
+            return
+
+        dy_arr = np.arange(-r, r + 1)
+        dx_arr = np.arange(-r, r + 1)
+        DY, DX = np.meshgrid(dy_arr, dx_arr, indexing='ij')
+        dist2 = DY ** 2 + DX ** 2
+
+        if self.weight_mode == 'gaussian':
+            # ガウシアン重み: 半径外もゼロにしない（σ で自然に減衰）
+            # ただし cutoff = 3σ 以遠は無視して高速化
+            sigma2 = self.sigma_px ** 2
+            weights_2d = np.exp(-dist2 / (2.0 * sigma2))
+            # カットオフ：値が max の 1% 未満は除外
+            mask = weights_2d >= 0.01
+        else:
+            # flat disk
+            mask = dist2 <= r ** 2
+            weights_2d = np.ones_like(dist2, dtype=np.float64)
+
+        disk_dy = DY[mask].astype(np.int32)
+        disk_dx = DX[mask].astype(np.int32)
+        disk_w  = weights_2d[mask]
+
+        results = []
+        for i, iz in enumerate(range(self.z_start_idx, self.z_end_idx)):
+            frame = self.volume[iz]
+            intensity_sum = 0.0
+            for (cx, cy) in self.atom_positions_px:
+                yy = cy + disk_dy
+                xx = cx + disk_dx
+                valid = (yy >= 0) & (yy < ny) & (xx >= 0) & (xx < nx)
+                intensity_sum += float(
+                    (frame[yy[valid], xx[valid]] * disk_w[valid]).sum())
+            z_ang = self.z_origin + iz * self.dz
+            results.append((z_ang, float(intensity_sum)))
+            self.progress.emit(i + 1, total)
+
+        self.finished.emit(results)
+
+
 class AtomViewerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -675,6 +748,9 @@ class AtomViewerWindow(QMainWindow):
         self.detected_peaks = []
         self.measure_type = 'distance'
         self._peak_worker = None
+        self.series_wid = None
+        self._iprofile_worker = None
+        self._iprofile_progress = None
         self.element_settings = {}   # 後方互換 (アクティブセットへの参照で上書き)
 
         self._build_ui()
@@ -1450,6 +1526,94 @@ class AtomViewerWindow(QMainWindow):
         peak_detect_group.setLayout(peak_detect_layout)
         left_layout.addWidget(peak_detect_group)
 
+        # --- 強度プロファイル（原子サイト自動検出） ---
+        iprofile_group = QGroupBox("▸ INTENSITY PROFILE (原子サイト自動検出)")
+        iprofile_layout = QVBoxLayout()
+        iprofile_layout.setSpacing(4)
+
+        iprofile_layout.addWidget(QLabel("Z走査範囲:"))
+        ipz_row = QHBoxLayout()
+        ipz_row.addWidget(QLabel("開始 (Å):"))
+        self.spin_iprofile_z_start = QDoubleSpinBox()
+        self.spin_iprofile_z_start.setRange(-1000.0, 1000.0)
+        self.spin_iprofile_z_start.setDecimals(3)
+        self.spin_iprofile_z_start.setValue(4.6)
+        self.spin_iprofile_z_start.setSingleStep(0.1)
+        ipz_row.addWidget(self.spin_iprofile_z_start)
+        ipz_row.addWidget(QLabel("終了 (Å):"))
+        self.spin_iprofile_z_end = QDoubleSpinBox()
+        self.spin_iprofile_z_end.setRange(-1000.0, 1000.0)
+        self.spin_iprofile_z_end.setDecimals(3)
+        self.spin_iprofile_z_end.setValue(5.4)
+        self.spin_iprofile_z_end.setSingleStep(0.1)
+        ipz_row.addWidget(self.spin_iprofile_z_end)
+        iprofile_layout.addLayout(ipz_row)
+
+        # Å 入力 → px 変換行
+        ip_ang_row = QHBoxLayout()
+        ip_ang_row.addWidget(QLabel("原子半径 (Å):"))
+        self.spin_iprofile_radius_ang = QDoubleSpinBox()
+        self.spin_iprofile_radius_ang.setRange(0.01, 20.0)
+        self.spin_iprofile_radius_ang.setDecimals(2)
+        self.spin_iprofile_radius_ang.setValue(0.80)
+        self.spin_iprofile_radius_ang.setSingleStep(0.05)
+        self.spin_iprofile_radius_ang.setFixedWidth(70)
+        ip_ang_row.addWidget(self.spin_iprofile_radius_ang)
+        self.btn_iprofile_ang_to_px = QPushButton("→ px 変換")
+        self.btn_iprofile_ang_to_px.setStyleSheet(
+            "font-size: 11px; padding: 4px 8px;")
+        self.btn_iprofile_ang_to_px.setToolTip(
+            "原子半径 (Å) ÷ dx (ボクセルサイズ) を計算して\n"
+            "サンプリング半径 (px) に反映します")
+        ip_ang_row.addWidget(self.btn_iprofile_ang_to_px)
+        ip_ang_row.addStretch()
+        iprofile_layout.addLayout(ip_ang_row)
+
+        ip_rad_row = QHBoxLayout()
+        ip_rad_row.addWidget(QLabel("サンプリング半径 (px):"))
+        self.spin_iprofile_radius = QSpinBox()
+        self.spin_iprofile_radius.setRange(1, 50)
+        self.spin_iprofile_radius.setValue(5)
+        self.spin_iprofile_radius.setToolTip(
+            "各原子サイト中心から何ピクセル以内を積算範囲とするか\n"
+            "ガウシアンモードでは σ の 3 倍以上を推奨")
+        ip_rad_row.addWidget(self.spin_iprofile_radius)
+        ip_rad_row.addStretch()
+        iprofile_layout.addLayout(ip_rad_row)
+
+        ip_weight_row = QHBoxLayout()
+        ip_weight_row.addWidget(QLabel("重み付け:"))
+        self.combo_iprofile_weight = QComboBox()
+        self.combo_iprofile_weight.addItems([
+            "ガウシアン (推奨)",
+            "一様 (フラットディスク)",
+        ])
+        self.combo_iprofile_weight.setCurrentIndex(0)
+        self.combo_iprofile_weight.setToolTip(
+            "ガウシアン: σ = 原子半径(Å)÷dx で重み付け。\n"
+            "  カットオフ半径への依存が大幅に低減します。\n"
+            "一様: 半径内を均等に積算。境界ピクセルの有無で\n"
+            "  結果が変わりやすいため注意。")
+        ip_weight_row.addWidget(self.combo_iprofile_weight)
+        ip_weight_row.addStretch()
+        iprofile_layout.addLayout(ip_weight_row)
+
+        self.btn_auto_detect_z = QPushButton("最適Z位置の自動検出＆プロット")
+        self.btn_auto_detect_z.setObjectName("primary")
+        self.btn_auto_detect_z.setToolTip(
+            "アクティブXYZセットの原子サイト（XY位置）を基準に\n"
+            "指定Z範囲の全フレームを走査して強度総和を計算し、\n"
+            "ピーク位置を検出してスライダーを自動移動します。")
+        iprofile_layout.addWidget(self.btn_auto_detect_z)
+
+        self.lbl_optimal_z = QLabel("最適Z: — (未計算)")
+        self.lbl_optimal_z.setStyleSheet("color: #90a8c0; font-size: 11px;")
+        self.lbl_optimal_z.setWordWrap(True)
+        iprofile_layout.addWidget(self.lbl_optimal_z)
+
+        iprofile_group.setLayout(iprofile_layout)
+        left_layout.addWidget(iprofile_group)
+
         left_layout.addStretch()
 
         # 左パネルをスクロール可能にラップ
@@ -1581,6 +1745,9 @@ class AtomViewerWindow(QMainWindow):
         self.canvas_yz.point_clicked.connect(
             lambda x, y: self._on_canvas_click(x, y, plane='yz'))
 
+        self.btn_auto_detect_z.clicked.connect(self._on_auto_detect_z)
+        self.btn_iprofile_ang_to_px.clicked.connect(self._on_iprofile_ang_to_px)
+
     # -------------------------------------------------------------------------
     # API再接続
     # -------------------------------------------------------------------------
@@ -1708,6 +1875,7 @@ class AtomViewerWindow(QMainWindow):
                     QApplication.processEvents()
 
             volume = np.stack(slices, axis=0)  # (Nz, Ny, Nx)
+            self.series_wid = wid
             self._set_volume_data(volume, f"{caption} (Series: {count} frames)")
 
         except Exception as e:
@@ -3243,6 +3411,201 @@ class AtomViewerWindow(QMainWindow):
             for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
                 cv.clear_peak_markers()
                 cv.draw_idle()
+
+    # -------------------------------------------------------------------------
+    # 強度プロファイル（原子サイト自動検出）
+    # -------------------------------------------------------------------------
+    def _on_iprofile_ang_to_px(self):
+        """原子半径 (Å) ÷ dx → サンプリング半径 (px) に変換してスピンボックスへ反映する。"""
+        dx = self.spin_dx.value()
+        if dx <= 0:
+            return
+        radius_ang = self.spin_iprofile_radius_ang.value()
+        radius_px = max(1, round(radius_ang / dx))
+        self.spin_iprofile_radius.setValue(radius_px)
+        self.statusBar().showMessage(
+            f"半径変換: {radius_ang:.2f} Å ÷ dx({dx:.4f} Å/px) = {radius_px} px")
+
+    def _on_auto_detect_z(self):
+        """アクティブXYZセットの原子サイトを基準に Z 走査 → 強度プロファイル計算を開始する。"""
+        if self.volume is None:
+            QMessageBox.information(self, "情報",
+                "ボリュームデータを読み込んでから実行してください")
+            return
+
+        # 対象原子 XY 位置を収集（アクティブセット優先、なければ visible 全セット）
+        atom_positions_ang = []
+        if 0 <= self.active_atom_set_index < len(self.atom_sets):
+            aset = self.atom_sets[self.active_atom_set_index]
+            if aset['visible']:
+                ox_off, oy_off, _ = aset['offset']
+                for a in aset['atoms']:
+                    atom_positions_ang.append((a['x'] + ox_off, a['y'] + oy_off))
+
+        if not atom_positions_ang:
+            for aset in self.atom_sets:
+                if aset['visible']:
+                    ox_off, oy_off, _ = aset['offset']
+                    for a in aset['atoms']:
+                        atom_positions_ang.append((a['x'] + ox_off, a['y'] + oy_off))
+
+        if not atom_positions_ang:
+            QMessageBox.warning(self, "警告",
+                "対象となる原子サイトがありません。\n"
+                "XYZファイルを読み込み、表示状態にしてください。")
+            return
+
+        m = self.metadata
+        dz, dy, dx = m['voxel_size']
+        x_origin, y_origin = m['x_range'][0], m['y_range'][0]
+        z_origin = m['z_range'][0]
+        nz, ny, nx = self.volume.shape
+
+        # Å → pixel 変換（画像範囲内のもののみ採用）
+        atom_positions_px = []
+        for (ax, ay) in atom_positions_ang:
+            ix = int(round((ax - x_origin) / dx))
+            iy = int(round((ay - y_origin) / dy))
+            if 0 <= ix < nx and 0 <= iy < ny:
+                atom_positions_px.append((ix, iy))
+
+        if not atom_positions_px:
+            QMessageBox.warning(self, "警告",
+                "原子サイトがボリュームの X/Y 範囲外です。\n"
+                "オフセットまたはボクセルサイズを確認してください。")
+            return
+
+        # Z 範囲 → インデックス
+        z_start = self.spin_iprofile_z_start.value()
+        z_end = self.spin_iprofile_z_end.value()
+        if z_start >= z_end:
+            QMessageBox.warning(self, "警告",
+                "Z開始 < Z終了 となるよう設定してください")
+            return
+
+        zi_start = max(0, int(round((z_start - z_origin) / dz)))
+        zi_end = min(nz, int(round((z_end - z_origin) / dz)) + 1)
+        if zi_start >= zi_end:
+            QMessageBox.warning(self, "警告",
+                "指定した Z 範囲内にフレームが存在しません\n"
+                "（ボクセルサイズ dz と Z 範囲を確認してください）")
+            return
+
+        radius_px = self.spin_iprofile_radius.value()
+        weight_mode = ('gaussian'
+                       if self.combo_iprofile_weight.currentIndex() == 0
+                       else 'flat')
+        # ガウシアンの σ = 原子半径(Å) ÷ dx
+        sigma_px = max(0.5, self.spin_iprofile_radius_ang.value() / dx)
+
+        n_frames = zi_end - zi_start
+        mode_label = "ガウシアン重み" if weight_mode == 'gaussian' else "フラットディスク"
+        self._iprofile_progress = QProgressDialog(
+            f"強度プロファイルを計算中 ({n_frames} フレーム, {mode_label})…",
+            "キャンセル", 0, n_frames, self)
+        self._iprofile_progress.setWindowTitle("Z 走査中")
+        self._iprofile_progress.setWindowModality(Qt.WindowModal)
+        self._iprofile_progress.setMinimumDuration(300)
+        self._iprofile_progress.show()
+
+        self.btn_auto_detect_z.setEnabled(False)
+        self._iprofile_worker = IntensityProfileWorker(
+            self.volume, zi_start, zi_end,
+            atom_positions_px, radius_px, z_origin, dz,
+            weight_mode=weight_mode, sigma_px=sigma_px)
+        self._iprofile_worker.progress.connect(self._on_iprofile_progress)
+        self._iprofile_worker.finished.connect(self._on_iprofile_done)
+        self._iprofile_worker.start()
+
+    def _on_iprofile_progress(self, done, total):
+        if self._iprofile_progress is not None:
+            self._iprofile_progress.setValue(done)
+            if self._iprofile_progress.wasCanceled():
+                if self._iprofile_worker is not None:
+                    self._iprofile_worker.terminate()
+                    self._iprofile_worker = None
+                self.btn_auto_detect_z.setEnabled(True)
+
+    def _on_iprofile_done(self, results):
+        self.btn_auto_detect_z.setEnabled(True)
+        if self._iprofile_progress is not None:
+            self._iprofile_progress.close()
+            self._iprofile_progress = None
+        self._iprofile_worker = None
+
+        if not results:
+            QMessageBox.information(self, "情報", "計算結果が得られませんでした")
+            return
+
+        z_values = [r[0] for r in results]
+        intensities = [r[1] for r in results]
+        peak_idx = int(np.argmax(intensities))
+        peak_z = z_values[peak_idx]
+        peak_intensity = intensities[peak_idx]
+
+        # スライダーを最適 Z に移動（内部ビューアを更新）
+        self.spin_z.setValue(peak_z)
+
+        # API 接続中かつシリーズウィンドウが既知なら外部アプリも更新
+        if self.air is not None and self.series_wid is not None:
+            m = self.metadata
+            dz = m['voxel_size'][0]
+            z_origin = m['z_range'][0]
+            nz = self.volume.shape[0]
+            frame_idx = max(0, min(nz - 1, int(round((peak_z - z_origin) / dz))))
+            try:
+                self.air.series_imageindex_set(self.series_wid, frame_idx)
+            except Exception as e:
+                print(f"[WARNING] series_imageindex_set 失敗: {e}")
+
+        self.lbl_optimal_z.setText(
+            f"最適Z: {peak_z:.3f} Å\n"
+            f"フレーム {peak_idx + 1} / {len(results)}\n"
+            f"強度総和: {peak_intensity:.4g}")
+        self.statusBar().showMessage(
+            f"最適Z検出: {peak_z:.3f} Å  (強度総和 = {peak_intensity:.4g}, "
+            f"フレーム {peak_idx + 1}/{len(results)})")
+
+        weight_mode = ('gaussian'
+                       if self.combo_iprofile_weight.currentIndex() == 0
+                       else 'flat')
+        sigma_ang = self.spin_iprofile_radius_ang.value()
+        self._plot_intensity_profile(z_values, intensities, peak_idx,
+                                     weight_mode, sigma_ang)
+
+    def _plot_intensity_profile(self, z_values, intensities, peak_idx,
+                                weight_mode='flat', sigma_ang=None):
+        """強度プロファイルを別ウィンドウで表示する。"""
+        fig, ax = plt.subplots(figsize=(9, 5))
+        fig.patch.set_facecolor('#f5f7fa')
+        ax.set_facecolor('#ffffff')
+        ax.spines[:].set_color('#d0dde8')
+
+        ax.plot(z_values, intensities,
+                color='#0077b6', linewidth=1.8,
+                marker='o', markersize=4, label='強度総和')
+
+        peak_z = z_values[peak_idx]
+        ax.axvline(x=peak_z, color='#e53935', linewidth=1.5,
+                   linestyle='--', label=f'最適 Z = {peak_z:.3f} Å')
+        ax.plot(peak_z, intensities[peak_idx],
+                marker='*', color='#e53935', markersize=14, zorder=5)
+
+        ax.set_xlabel("Z (Å)", fontsize=12, color='#1a2a3a')
+        ax.set_ylabel("強度総和 (a.u.)", fontsize=12, color='#1a2a3a')
+        if weight_mode == 'gaussian':
+            subtitle = f"ガウシアン重み付き  σ = {sigma_ang:.2f} Å"
+        else:
+            r_px = self.spin_iprofile_radius.value()
+            subtitle = f"フラットディスク  r = {r_px} px"
+        ax.set_title(f"原子サイト強度プロファイル  [{subtitle}]",
+                     fontsize=12, fontweight='bold', color='#0077b6')
+        ax.tick_params(colors='#4a6880')
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3, linewidth=0.8, color='#b0c4d8')
+
+        fig.tight_layout()
+        plt.show(block=False)
 
 
 # =============================================================================
