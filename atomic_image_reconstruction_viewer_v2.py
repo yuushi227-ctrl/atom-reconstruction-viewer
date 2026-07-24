@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 """
 Atom Image Viewer - 原子像再構成ビューア (3D-AIR-IMAGE API対応版)
 ==================================================================
@@ -35,7 +35,8 @@ try:
         QMessageBox, QCheckBox, QSplitter, QFrame, QTableWidget,
         QTableWidgetItem, QHeaderView, QToolBar, QAction, QSizePolicy,
         QDialog, QListWidget, QDialogButtonBox, QProgressBar,
-        QListWidgetItem, QScrollArea, QColorDialog
+        QListWidgetItem, QScrollArea, QColorDialog,
+        QRadioButton, QButtonGroup, QTabWidget, QProgressDialog
     )
     from PyQt5.QtCore import Qt, pyqtSignal, QPointF, QThread, pyqtSlot
     from PyQt5.QtGui import QFont, QColor, QIcon
@@ -170,6 +171,155 @@ def get_element_color(element):
 
 def get_element_radius(element):
     return ELEMENT_RADII.get(element, ELEMENT_RADII['default'])
+
+
+# =============================================================================
+# ピーク精緻化定数
+# =============================================================================
+PEAK_REFINE_GAUSSIAN = 0
+PEAK_REFINE_CENTROID = 1
+PEAK_REFINE_PARABOLA = 2
+PEAK_REFINE_OFF = 3
+
+_FIT_SIZE_DEFAULT = 7
+
+
+# =============================================================================
+# ピーク精緻化関数 (単体テスト可能・モジュールレベル)
+# =============================================================================
+def _peak_find_coarse(data_2d, px, py, search_radius):
+    """クリック周辺の粗いピーク位置 (2D最大値) を返す。Returns (ix_max, iy_max) integer."""
+    ny, nx = data_2d.shape
+    ipx, ipy = int(round(px)), int(round(py))
+    x0 = max(0, ipx - search_radius)
+    x1 = min(nx, ipx + search_radius + 1)
+    y0 = max(0, ipy - search_radius)
+    y1 = min(ny, ipy + search_radius + 1)
+    region = data_2d[y0:y1, x0:x1]
+    if region.size == 0:
+        return ipx, ipy
+    local_y, local_x = np.unravel_index(np.argmax(region), region.shape)
+    return x0 + local_x, y0 + local_y
+
+
+def peak_refine_parabola_3d(volume, iz, iy, ix):
+    """各軸独立パラボラフィット。Returns (x_sub, y_sub, z_sub, log_str)."""
+    nz, ny, nx = volume.shape
+
+    def _para(arr, i_c):
+        if i_c <= 0 or i_c >= len(arr) - 1:
+            return float(i_c)
+        im1, i0, ip1 = float(arr[i_c - 1]), float(arr[i_c]), float(arr[i_c + 1])
+        denom = im1 - 2.0 * i0 + ip1
+        if abs(denom) < 1e-12:
+            return float(i_c)
+        return i_c + (im1 - ip1) / (2.0 * denom)
+
+    half = 3
+    x0, x1 = max(0, ix - half), min(nx, ix + half + 1)
+    y0, y1 = max(0, iy - half), min(ny, iy + half + 1)
+    z0, z1 = max(0, iz - half), min(nz, iz + half + 1)
+
+    x_sub = x0 + _para(volume[iz, iy, x0:x1], ix - x0)
+    y_sub = y0 + _para(volume[iz, y0:y1, ix], iy - y0)
+    z_sub = z0 + _para(volume[z0:z1, iy, ix], iz - z0)
+
+    return x_sub, y_sub, z_sub, f"parabola→({x_sub:.3f},{y_sub:.3f},{z_sub:.3f})"
+
+
+def peak_refine_centroid_3d(volume, iz, iy, ix, fit_size=7):
+    """3D重心法 (バックグラウンド除去あり)。Returns (x_sub, y_sub, z_sub, log_str)."""
+    nz, ny, nx = volume.shape
+    half = fit_size // 2
+    z0, z1 = max(0, iz - half), min(nz, iz + half + 1)
+    y0, y1 = max(0, iy - half), min(ny, iy + half + 1)
+    x0, x1 = max(0, ix - half), min(nx, ix + half + 1)
+
+    region = volume[z0:z1, y0:y1, x0:x1].astype(np.float64)
+    region = region - region.min()
+    total = region.sum()
+    if total < 1e-12:
+        return float(ix), float(iy), float(iz), "centroid:zero→fallback"
+
+    zg, yg, xg = np.mgrid[z0:z1, y0:y1, x0:x1].astype(np.float64)
+    x_sub = float((xg * region).sum() / total)
+    y_sub = float((yg * region).sum() / total)
+    z_sub = float((zg * region).sum() / total)
+    return x_sub, y_sub, z_sub, f"centroid→({x_sub:.3f},{y_sub:.3f},{z_sub:.3f})"
+
+
+def peak_refine_gaussian_3d(volume, iz, iy, ix, fit_size=7):
+    """3Dガウシアンフィット。収束失敗またはフィット領域不足でNoneを返す。
+    Returns (x_sub, y_sub, z_sub, sx, sy, sz, log_str) or None."""
+    from scipy.optimize import curve_fit
+
+    nz, ny, nx = volume.shape
+    half = fit_size // 2
+    z0, z1 = max(0, iz - half), min(nz, iz + half + 1)
+    y0, y1 = max(0, iy - half), min(ny, iy + half + 1)
+    x0, x1 = max(0, ix - half), min(nx, ix + half + 1)
+
+    region = volume[z0:z1, y0:y1, x0:x1].astype(np.float64)
+    if region.size < 8:
+        return None
+    region_min, region_max = float(region.min()), float(region.max())
+    if region_max - region_min < 1e-12:
+        return None
+    if region.size < (fit_size ** 3) * 0.4:
+        return None
+
+    zg, yg, xg = np.mgrid[z0:z1, y0:y1, x0:x1].astype(np.float64)
+    xf, yf, zf = xg.ravel(), yg.ravel(), zg.ravel()
+    data = region.ravel()
+
+    def _gauss3d(coords, A, cx, cy, cz, sx, sy, sz, B):
+        xc, yc, zc = coords
+        return A * np.exp(
+            -((xc - cx) ** 2 / (2 * sx ** 2)
+              + (yc - cy) ** 2 / (2 * sy ** 2)
+              + (zc - cz) ** 2 / (2 * sz ** 2))
+        ) + B
+
+    A0 = region_max - region_min
+    p0 = [A0, float(ix), float(iy), float(iz), 1.5, 1.5, 1.5, region_min]
+    lo = [0.0, float(x0) - 0.5, float(y0) - 0.5, float(z0) - 0.5,
+          0.2, 0.2, 0.2, -np.inf]
+    hi = [np.inf, float(x1) + 0.5, float(y1) + 0.5, float(z1) + 0.5,
+          float(fit_size) * 2, float(fit_size) * 2, float(fit_size) * 2, np.inf]
+
+    try:
+        popt, _ = curve_fit(_gauss3d, (xf, yf, zf), data,
+                            p0=p0, bounds=(lo, hi), maxfev=2000)
+        x_fit, y_fit, z_fit = popt[1], popt[2], popt[3]
+        sx_fit, sy_fit, sz_fit = popt[4], popt[5], popt[6]
+
+        if not (x0 - 0.5 <= x_fit <= x1 + 0.5
+                and y0 - 0.5 <= y_fit <= y1 + 0.5
+                and z0 - 0.5 <= z_fit <= z1 + 0.5):
+            return None
+
+        log = (f"gaussian→({x_fit:.3f},{y_fit:.3f},{z_fit:.3f}) "
+               f"σ=({sx_fit:.2f},{sy_fit:.2f},{sz_fit:.2f})")
+        return x_fit, y_fit, z_fit, sx_fit, sy_fit, sz_fit, log
+    except Exception:
+        return None
+
+
+def _apply_peak_refinement_on_region(volume, iz, iy, ix, refine_mode, fit_size):
+    """指定アルゴリズムで体積領域内のピーク精緻化を行い (x_sub, y_sub, z_sub) を返す。"""
+    if refine_mode == PEAK_REFINE_GAUSSIAN:
+        result = peak_refine_gaussian_3d(volume, iz, iy, ix, fit_size)
+        if result is None:
+            r = peak_refine_parabola_3d(volume, iz, iy, ix)
+            return r[0], r[1], r[2]
+        return result[0], result[1], result[2]
+    if refine_mode == PEAK_REFINE_CENTROID:
+        r = peak_refine_centroid_3d(volume, iz, iy, ix, fit_size)
+        return r[0], r[1], r[2]
+    if refine_mode == PEAK_REFINE_PARABOLA:
+        r = peak_refine_parabola_3d(volume, iz, iy, ix)
+        return r[0], r[1], r[2]
+    return float(ix), float(iy), float(iz)
 
 
 # =============================================================================
@@ -320,6 +470,9 @@ class SliceCanvas(FigureCanvas):
         self.click_markers = []
         self.distance_lines = []
         self.distance_texts = []
+        self.angle_lines = []
+        self.angle_texts = []
+        self.peak_markers = []
 
         self.fig.canvas.mpl_connect('button_press_event', self._on_click)
 
@@ -384,33 +537,122 @@ class SliceCanvas(FigureCanvas):
 
     def clear_canvas_markers(self):
         """データは消さずキャンバス上のマーカー描画のみ削除"""
-        for obj in self.click_markers:
-            try:
-                obj.remove()
-            except Exception:
-                pass
-        self.click_markers.clear()
-        for obj in self.distance_lines:
-            try:
-                obj.remove()
-            except Exception:
-                pass
-        self.distance_lines.clear()
-        for obj in self.distance_texts:
-            try:
-                obj.remove()
-            except Exception:
-                pass
-        self.distance_texts.clear()
+        for lst in (self.click_markers, self.distance_lines, self.distance_texts,
+                    self.angle_lines, self.angle_texts):
+            for obj in lst:
+                try:
+                    obj.remove()
+                except Exception:
+                    pass
+            lst.clear()
 
     def clear_measurements(self):
         self.clear_canvas_markers()
         self.draw_idle()
 
+    def add_angle_lines(self, x1, y1, x2, y2, x3, y3, angle_deg):
+        """Draw P1-P2, P2-P3 segments with labeled markers and angle text at vertex P2."""
+        line_color = '#e08d3c'
+        for xs, ys in (([x1, x2], [y1, y2]), ([x2, x3], [y2, y3])):
+            line = Line2D(xs, ys, color=line_color, linewidth=1.5, linestyle='--', zorder=9)
+            self.ax.add_line(line)
+            self.angle_lines.append(line)
+        for x, y, lbl, col in [(x1, y1, 'A1', '#89b4fa'),
+                                 (x2, y2, 'A2', '#ff79c6'),
+                                 (x3, y3, 'A3', '#f9e2af')]:
+            mk = self.ax.plot(x, y, '+', color=col, markersize=15,
+                              markeredgewidth=2, zorder=10)[0]
+            self.click_markers.append(mk)
+            txt = self.ax.text(x + 0.1, y + 0.1, lbl, color=col,
+                               fontsize=9, fontweight='bold', zorder=10)
+            self.click_markers.append(txt)
+        atxt = self.ax.text(
+            x2, y2 - 0.15, f"{angle_deg:.1f}°",
+            color=line_color, fontsize=10, fontweight='bold',
+            ha='center', va='top', zorder=10,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='#ffffff',
+                      edgecolor=line_color, alpha=0.95)
+        )
+        self.angle_texts.append(atxt)
+        self.draw_idle()
+
+    def draw_peak_markers(self, peaks_xy):
+        """Draw detected peaks as cyan scatter markers at (x, y) positions in Å."""
+        self.clear_peak_markers()
+        if not peaks_xy:
+            return
+        xs = [p[0] for p in peaks_xy]
+        ys = [p[1] for p in peaks_xy]
+        sc = self.ax.scatter(xs, ys, s=35, c='#00ffcc', marker='o',
+                             alpha=0.55, linewidths=0.8, edgecolors='#009966',
+                             zorder=8)
+        self.peak_markers.append(sc)
+        self.draw_idle()
+
+    def clear_peak_markers(self):
+        """Remove only auto-detected peak markers (keep measurement markers)."""
+        for obj in self.peak_markers:
+            try:
+                obj.remove()
+            except Exception:
+                pass
+        self.peak_markers.clear()
+
 
 # =============================================================================
 # メインウィンドウ
 # =============================================================================
+# =============================================================================
+# 非同期ピーク検出ワーカー
+# =============================================================================
+class PeakDetectionWorker(QThread):
+    finished = pyqtSignal(list)
+
+    def __init__(self, volume_region, z_offset, metadata, percentile, min_dist_ang,
+                 refine_mode=PEAK_REFINE_OFF, fit_size=_FIT_SIZE_DEFAULT):
+        super().__init__()
+        self.volume_region = volume_region
+        self.z_offset = z_offset
+        self.metadata = metadata
+        self.percentile = percentile
+        self.min_dist_ang = min_dist_ang
+        self.refine_mode = refine_mode
+        self.fit_size = fit_size
+
+    def run(self):
+        m = self.metadata
+        dz_v, dy_v, dx_v = m['voxel_size']
+        oz, oy, ox = m['z_range'][0], m['y_range'][0], m['x_range'][0]
+        mda = self.min_dist_ang
+        filter_size = (
+            max(1, 2 * int(round(mda / dz_v)) + 1),
+            max(1, 2 * int(round(mda / dy_v)) + 1),
+            max(1, 2 * int(round(mda / dx_v)) + 1),
+        )
+        vol = self.volume_region.astype(np.float32)
+        filtered = maximum_filter(vol, size=filter_size)
+        threshold = np.percentile(vol, self.percentile)
+        local_max = (vol == filtered) & (vol > threshold)
+        zz, yy, xx = np.where(local_max)
+        peaks = []
+        for zi, yi, xi in zip(zz, yy, xx):
+            abs_zi = int(zi) + self.z_offset
+            if self.refine_mode != PEAK_REFINE_OFF:
+                x_sub, y_sub, z_sub = _apply_peak_refinement_on_region(
+                    vol, int(zi), int(yi), int(xi), self.refine_mode, self.fit_size)
+                abs_z_sub = z_sub + self.z_offset
+            else:
+                x_sub, y_sub, abs_z_sub = float(xi), float(yi), float(abs_zi)
+            peaks.append({
+                'x': ox + x_sub * dx_v,
+                'y': oy + y_sub * dy_v,
+                'z': oz + abs_z_sub * dz_v,
+                'px': x_sub, 'py': y_sub, 'pz': abs_z_sub,
+                'intensity': float(vol[int(zi), int(yi), int(xi)]),
+            })
+        self.finished.emit(peaks)
+
+
 class AtomViewerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -427,6 +669,10 @@ class AtomViewerWindow(QMainWindow):
         self.atoms = []
         self.click_points = []
         self.measurements = []
+        self.angle_measurements = []
+        self.detected_peaks = []
+        self.measure_type = 'distance'
+        self._peak_worker = None
         self.element_settings = {}   # {element: {'color': '#hex', 'radius': float}}
 
         self._build_ui()
@@ -687,6 +933,14 @@ class AtomViewerWindow(QMainWindow):
         self.btn_reconnect.setStyleSheet("font-size: 11px; padding: 5px 10px; color: #4a7a9a;")
         file_layout.addWidget(self.btn_reconnect)
 
+        self.btn_redraw_volume = QPushButton("⟳  表示を再描画")
+        self.btn_redraw_volume.setToolTip(
+            "描画キャッシュをクリアし、現スライスを再生成します。\n"
+            "ビューポート (拡大率・パン) を初期状態に戻します。\n"
+            "データ・測定履歴は維持されます。")
+        self.btn_redraw_volume.setStyleSheet("font-size: 11px; padding: 5px 10px;")
+        file_layout.addWidget(self.btn_redraw_volume)
+
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet("border-top: 1px solid #061828;")
@@ -875,7 +1129,7 @@ class AtomViewerWindow(QMainWindow):
         elem_group.setLayout(elem_outer_layout)
         left_layout.addWidget(elem_group)
 
-        # --- 距離測定 ---
+        # --- 距離・角度測定 ---
         measure_group = QGroupBox("▸ MEASURE")
         measure_layout = QVBoxLayout()
 
@@ -890,6 +1144,19 @@ class AtomViewerWindow(QMainWindow):
         self.btn_toggle_measure.setCheckable(True)
         measure_layout.addWidget(self.btn_toggle_measure)
 
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("測定タイプ:"))
+        self.radio_dist = QRadioButton("2点距離")
+        self.radio_angle = QRadioButton("3点角度")
+        self.radio_dist.setChecked(True)
+        self.btn_grp_measure_type = QButtonGroup(self)
+        self.btn_grp_measure_type.addButton(self.radio_dist, 0)
+        self.btn_grp_measure_type.addButton(self.radio_angle, 1)
+        type_row.addWidget(self.radio_dist)
+        type_row.addWidget(self.radio_angle)
+        type_row.addStretch()
+        measure_layout.addLayout(type_row)
+
         search_row = QHBoxLayout()
         search_row.addWidget(QLabel("ピーク探索半径 (px):"))
         self.spin_search_radius = QSpinBox()
@@ -898,28 +1165,201 @@ class AtomViewerWindow(QMainWindow):
         search_row.addWidget(self.spin_search_radius)
         measure_layout.addLayout(search_row)
 
-        self.btn_clear_measure = QPushButton("✕  CLEAR")
+        # --- PEAK REFINEMENT (サブボクセル精度) ---
+        refine_sep = QFrame()
+        refine_sep.setFrameShape(QFrame.HLine)
+        refine_sep.setStyleSheet("border-top: 1px solid #d0dde8; margin: 2px 0;")
+        measure_layout.addWidget(refine_sep)
+
+        refine_lbl = QLabel("PEAK REFINEMENT")
+        refine_lbl.setStyleSheet(
+            "color: #0077b6; font-size: 10px; font-weight: bold; letter-spacing: 1px;")
+        measure_layout.addWidget(refine_lbl)
+
+        refine_row = QHBoxLayout()
+        refine_row.addWidget(QLabel("サブボクセル精度:"))
+        self.combo_peak_refine = QComboBox()
+        self.combo_peak_refine.addItems([
+            "ガウシアンフィット",
+            "重心",
+            "パラボラ",
+            "OFF (従来動作)",
+        ])
+        self.combo_peak_refine.setCurrentIndex(0)
+        self.combo_peak_refine.setToolTip(
+            "ガウシアンフィット: 最高精度 (~0.01 Å), scipy.optimize.curve_fit 使用\n"
+            "重心: 高速・中精度\n"
+            "パラボラ: 軽量フォールバック\n"
+            "OFF: 従来の3×3重心のみ (後方互換)")
+        refine_row.addWidget(self.combo_peak_refine)
+        measure_layout.addLayout(refine_row)
+
+        fit_size_row = QHBoxLayout()
+        fit_size_row.addWidget(QLabel("フィット領域 (voxel):"))
+        self.spin_fit_size = QSpinBox()
+        self.spin_fit_size.setRange(3, 15)
+        self.spin_fit_size.setValue(_FIT_SIZE_DEFAULT)
+        self.spin_fit_size.setSingleStep(2)
+        self.spin_fit_size.setToolTip("奇数のみ有効 (3/5/7/9/11/13/15)\n大きすぎると隣ピークを巻き込む")
+        fit_size_row.addWidget(self.spin_fit_size)
+        measure_layout.addLayout(fit_size_row)
+
+        self.chk_fit_log = QCheckBox("フィット詳細ログ (デバッグ)")
+        self.chk_fit_log.setChecked(False)
+        self.chk_fit_log.setToolTip("ONにするとクリック時に精緻化詳細をステータスバーに表示")
+        measure_layout.addWidget(self.chk_fit_log)
+
+        self.chk_freeze_markers = QCheckBox("マーカー固定 (Zスライスに追従しない)")
+        self.chk_freeze_markers.setChecked(False)
+        self.chk_freeze_markers.setToolTip(
+            "ONにすると測定点マーカーが元のÅ座標に固定されます。\n"
+            "Zスライスを変えても位置・角度が変わらないため、\n"
+            "別スライスの原子像と重ねて比較できます。")
+        measure_layout.addWidget(self.chk_freeze_markers)
+
+        self.btn_clear_measure = QPushButton("✕  CLEAR (現タブ)")
         self.btn_clear_measure.setObjectName("danger")
         measure_layout.addWidget(self.btn_clear_measure)
 
         measure_group.setLayout(measure_layout)
         left_layout.addWidget(measure_group)
 
-        # --- 測定結果テーブル ---
+        # --- 測定結果テーブル (3タブ) ---
         result_group = QGroupBox("▸ RESULTS")
         result_layout = QVBoxLayout()
+        result_layout.setContentsMargins(4, 4, 4, 4)
 
-        self.table_results = QTableWidget(0, 3)
-        self.table_results.setHorizontalHeaderLabels(["点1 (Å)", "点2 (Å)", "距離 (Å)"])
-        self.table_results.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table_results.setMaximumHeight(160)
-        result_layout.addWidget(self.table_results)
+        self.tab_results = QTabWidget()
 
-        self.btn_export_csv = QPushButton("↓  CSV EXPORT")
-        result_layout.addWidget(self.btn_export_csv)
+        # 距離タブ
+        dist_tab = QWidget()
+        dist_tab_layout = QVBoxLayout(dist_tab)
+        dist_tab_layout.setContentsMargins(2, 4, 2, 2)
+        self.table_dist = QTableWidget(0, 3)
+        self.table_dist.setHorizontalHeaderLabels(["点1 (Å)", "点2 (Å)", "距離 (Å)"])
+        self.table_dist.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_dist.setMaximumHeight(130)
+        dist_tab_layout.addWidget(self.table_dist)
+        dist_btn_row = QHBoxLayout()
+        self.btn_reset_dist = QPushButton("✕  選択リセット")
+        self.btn_reset_dist.setObjectName("danger")
+        self.btn_reset_dist.setToolTip("進行中選択 + 距離履歴 + マーカーをすべてクリア")
+        dist_btn_row.addWidget(self.btn_reset_dist)
+        self.btn_export_dist_csv = QPushButton("↓  CSV EXPORT (距離)")
+        dist_btn_row.addWidget(self.btn_export_dist_csv)
+        dist_tab_layout.addLayout(dist_btn_row)
+        self.tab_results.addTab(dist_tab, "距離")
 
+        # 角度タブ
+        angle_tab = QWidget()
+        angle_tab_layout = QVBoxLayout(angle_tab)
+        angle_tab_layout.setContentsMargins(2, 4, 2, 2)
+        self.table_angle = QTableWidget(0, 6)
+        self.table_angle.setHorizontalHeaderLabels(
+            ["点1 (Å)", "点2/頂点 (Å)", "点3 (Å)", "角度 (°)", "d12 (Å)", "d23 (Å)"])
+        self.table_angle.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_angle.setMaximumHeight(130)
+        angle_tab_layout.addWidget(self.table_angle)
+        angle_btn_row = QHBoxLayout()
+        self.btn_reset_angle = QPushButton("✕  選択リセット")
+        self.btn_reset_angle.setObjectName("danger")
+        self.btn_reset_angle.setToolTip("進行中選択 + 角度履歴 + マーカーをすべてクリア")
+        angle_btn_row.addWidget(self.btn_reset_angle)
+        self.btn_export_angle_csv = QPushButton("↓  CSV EXPORT (角度)")
+        angle_btn_row.addWidget(self.btn_export_angle_csv)
+        angle_tab_layout.addLayout(angle_btn_row)
+        self.tab_results.addTab(angle_tab, "角度")
+
+        # ピークタブ
+        peak_tab = QWidget()
+        peak_tab_layout = QVBoxLayout(peak_tab)
+        peak_tab_layout.setContentsMargins(2, 4, 2, 2)
+        self.table_peaks = QTableWidget(0, 5)
+        self.table_peaks.setHorizontalHeaderLabels(
+            ["No.", "x (Å)", "y (Å)", "z (Å)", "強度"])
+        self.table_peaks.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_peaks.setMaximumHeight(130)
+        peak_tab_layout.addWidget(self.table_peaks)
+        self.btn_export_peaks_csv = QPushButton("↓  CSV EXPORT (ピーク)")
+        peak_tab_layout.addWidget(self.btn_export_peaks_csv)
+        self.tab_results.addTab(peak_tab, "ピーク")
+
+        result_layout.addWidget(self.tab_results)
         result_group.setLayout(result_layout)
         left_layout.addWidget(result_group)
+
+        # --- ピーク自動検出 ---
+        peak_detect_group = QGroupBox("▸ PEAK DETECTION")
+        peak_detect_layout = QVBoxLayout()
+
+        peak_detect_layout.addWidget(QLabel("検出範囲:"))
+        range_row = QHBoxLayout()
+        self.radio_peak_current = QRadioButton("現スライス")
+        self.radio_peak_zrange = QRadioButton("Z範囲")
+        self.radio_peak_full = QRadioButton("全ボリューム")
+        self.radio_peak_current.setChecked(True)
+        self.btn_grp_peak_range = QButtonGroup(self)
+        self.btn_grp_peak_range.addButton(self.radio_peak_current, 0)
+        self.btn_grp_peak_range.addButton(self.radio_peak_zrange, 1)
+        self.btn_grp_peak_range.addButton(self.radio_peak_full, 2)
+        range_row.addWidget(self.radio_peak_current)
+        range_row.addWidget(self.radio_peak_zrange)
+        range_row.addWidget(self.radio_peak_full)
+        range_row.addStretch()
+        peak_detect_layout.addLayout(range_row)
+
+        zrange_row = QHBoxLayout()
+        zrange_row.addWidget(QLabel("Z開始 (Å):"))
+        self.spin_peak_z_start = QDoubleSpinBox()
+        self.spin_peak_z_start.setRange(-1000.0, 1000.0)
+        self.spin_peak_z_start.setDecimals(3)
+        self.spin_peak_z_start.setValue(0.0)
+        self.spin_peak_z_start.setEnabled(False)
+        zrange_row.addWidget(self.spin_peak_z_start)
+        zrange_row.addWidget(QLabel("終了 (Å):"))
+        self.spin_peak_z_end = QDoubleSpinBox()
+        self.spin_peak_z_end.setRange(-1000.0, 1000.0)
+        self.spin_peak_z_end.setDecimals(3)
+        self.spin_peak_z_end.setValue(1.0)
+        self.spin_peak_z_end.setEnabled(False)
+        zrange_row.addWidget(self.spin_peak_z_end)
+        peak_detect_layout.addLayout(zrange_row)
+
+        pct_param_row = QHBoxLayout()
+        pct_param_row.addWidget(QLabel("最小強度 (%tile):"))
+        self.spin_peak_percentile = QDoubleSpinBox()
+        self.spin_peak_percentile.setRange(50.0, 99.99)
+        self.spin_peak_percentile.setDecimals(1)
+        self.spin_peak_percentile.setValue(99.0)
+        self.spin_peak_percentile.setSingleStep(0.5)
+        pct_param_row.addWidget(self.spin_peak_percentile)
+        peak_detect_layout.addLayout(pct_param_row)
+
+        dist_param_row = QHBoxLayout()
+        dist_param_row.addWidget(QLabel("最小ピーク間距離 (Å):"))
+        self.spin_peak_min_dist = QDoubleSpinBox()
+        self.spin_peak_min_dist.setRange(0.1, 50.0)
+        self.spin_peak_min_dist.setDecimals(2)
+        self.spin_peak_min_dist.setValue(1.5)
+        self.spin_peak_min_dist.setSingleStep(0.1)
+        dist_param_row.addWidget(self.spin_peak_min_dist)
+        peak_detect_layout.addLayout(dist_param_row)
+
+        self.btn_detect_peaks = QPushButton("▶  ピーク自動検出")
+        self.btn_detect_peaks.setObjectName("primary")
+        peak_detect_layout.addWidget(self.btn_detect_peaks)
+
+        chk_row = QHBoxLayout()
+        self.chk_show_peak_markers = QCheckBox("検出マーカー表示")
+        self.chk_show_peak_markers.setChecked(True)
+        self.chk_snap_to_peaks = QCheckBox("検出マーカーにスナップ")
+        self.chk_snap_to_peaks.setChecked(True)
+        chk_row.addWidget(self.chk_show_peak_markers)
+        chk_row.addWidget(self.chk_snap_to_peaks)
+        peak_detect_layout.addLayout(chk_row)
+
+        peak_detect_group.setLayout(peak_detect_layout)
+        left_layout.addWidget(peak_detect_group)
 
         left_layout.addStretch()
 
@@ -983,6 +1423,7 @@ class AtomViewerWindow(QMainWindow):
         self.btn_load_series.clicked.connect(self._on_load_series)
         self.btn_load_file.clicked.connect(self._on_load_file)
         self.btn_reconnect.clicked.connect(self._on_reconnect)
+        self.btn_redraw_volume.clicked.connect(self._on_redraw_volume)
         self.btn_load_xyz.clicked.connect(self._on_load_xyz)
         self.btn_apply_voxel.clicked.connect(self._on_apply_voxel)
 
@@ -1005,8 +1446,18 @@ class AtomViewerWindow(QMainWindow):
         self.chk_link_cluster_z.stateChanged.connect(self._on_link_cluster_z_changed)
 
         self.btn_toggle_measure.toggled.connect(self._toggle_measure_mode)
-        self.btn_clear_measure.clicked.connect(self._clear_measurements)
-        self.btn_export_csv.clicked.connect(self._export_csv)
+        self.btn_clear_measure.clicked.connect(self._clear_current_tab)
+        self.btn_reset_dist.clicked.connect(self._on_reset_dist)
+        self.btn_reset_angle.clicked.connect(self._on_reset_angle)
+        self.btn_export_dist_csv.clicked.connect(self._export_distance_csv)
+        self.btn_export_angle_csv.clicked.connect(self._export_angle_csv)
+        self.btn_export_peaks_csv.clicked.connect(self._export_peaks_csv)
+        self.spin_fit_size.valueChanged.connect(self._on_fit_size_changed)
+        self.btn_grp_measure_type.buttonClicked.connect(self._on_measure_type_changed)
+        self.btn_detect_peaks.clicked.connect(self._on_detect_peaks)
+        self.chk_show_peak_markers.stateChanged.connect(self._on_show_peaks_changed)
+        self.radio_peak_zrange.toggled.connect(self._on_peak_range_changed)
+        self.chk_freeze_markers.stateChanged.connect(lambda _: self._redraw_measurements())
 
         self.canvas_xy.point_clicked.connect(lambda x, y: self._on_canvas_click(x, y))
 
@@ -1031,6 +1482,25 @@ class AtomViewerWindow(QMainWindow):
             QMessageBox.warning(self, "接続失敗",
                 "3D-AIR-IMAGE API に接続できませんでした。\n"
                 "3D-AIR-IMAGEが起動していることを確認してください。")
+
+    # -------------------------------------------------------------------------
+    # ボリューム表示再描画 (データ再取得なし)
+    # -------------------------------------------------------------------------
+    def _on_redraw_volume(self):
+        """描画キャッシュクリア + ビューポートリセット + 現スライス再描画。
+        データ・測定履歴は一切変更しない。"""
+        if self.volume is None:
+            self.statusBar().showMessage("ボリュームデータが未読み込みです")
+            return
+
+        # ビューポートをextentに合わせてリセット
+        extent = self._get_extent('xy')
+        self.canvas_xy.ax.set_xlim(extent[0], extent[1])
+        self.canvas_xy.ax.set_ylim(extent[2], extent[3])
+
+        # 現スライスを再描画 (マーカー類も再描画される)
+        self._update_slice()
+        self.statusBar().showMessage("ボリュームを再描画しました")
 
     # -------------------------------------------------------------------------
     # 3D-AIR-IMAGE から取得
@@ -1343,6 +1813,7 @@ class AtomViewerWindow(QMainWindow):
             self.spin_cluster_z.blockSignals(False)
         self._update_atom_overlay_for_plane()
         self._redraw_measurements()
+        self._update_peak_display()
 
     def _update_all_slices(self):
         self._update_slice()
@@ -1529,14 +2000,123 @@ class AtomViewerWindow(QMainWindow):
     def _toggle_measure_mode(self, checked):
         self.measure_mode = checked
         if checked:
-            self.lbl_measure_mode.setText("◉ MEASURE  ON  — 2点をクリック")
-            self.lbl_measure_mode.setStyleSheet(
-                "font-weight: bold; font-size: 11px; letter-spacing: 1px; color: #00875a;")
             self.click_points = []
+            self._update_measure_status_label()
         else:
             self.lbl_measure_mode.setText("● MEASURE  OFF")
             self.lbl_measure_mode.setStyleSheet(
                 "font-weight: bold; font-size: 11px; letter-spacing: 2px; color: #90a8c0;")
+
+    def _update_measure_status_label(self):
+        """Update the MEASURE mode status label to reflect type and progress."""
+        if not self.measure_mode:
+            return
+        if self.measure_type == 'distance':
+            self.lbl_measure_mode.setText("◉ MEASURE  ON  — 2点をクリック")
+            self.lbl_measure_mode.setStyleSheet(
+                "font-weight: bold; font-size: 11px; letter-spacing: 1px; color: #00875a;")
+        else:
+            n = len(self.click_points)
+            self.lbl_measure_mode.setText(
+                f"◉ 3点角度モード ON — 3点をクリック (現在 {n}/3)")
+            self.lbl_measure_mode.setStyleSheet(
+                "font-weight: bold; font-size: 11px; letter-spacing: 1px; color: #e08d3c;")
+
+    def _on_measure_type_changed(self, _btn):
+        """Handle measurement type radio button change."""
+        self.measure_type = 'angle' if self.radio_angle.isChecked() else 'distance'
+        self.click_points = []
+        self.canvas_xy.clear_canvas_markers()
+        self._redraw_measurements()
+        if self.measure_mode:
+            self._update_measure_status_label()
+
+    def _snap_or_find_peak(self, data_2d, px, py, search_r, x_real, y_real):
+        """Return (peak_px, peak_py): snap to nearest detected peak or run _find_peak."""
+        if (self.chk_snap_to_peaks.isChecked()
+                and self.detected_peaks
+                and self.chk_show_peak_markers.isChecked()):
+            m = self.metadata
+            dx_v, dy_v = m['voxel_size'][2], m['voxel_size'][1]
+            ox, oy = m['x_range'][0], m['y_range'][0]
+            snap_r_ang = search_r * min(dx_v, dy_v)
+            best_d = float('inf')
+            best_px, best_py = None, None
+            for pk in self.detected_peaks:
+                d = np.hypot(pk['x'] - x_real, pk['y'] - y_real)
+                if d < snap_r_ang and d < best_d:
+                    best_d = d
+                    best_px = (pk['x'] - ox) / dx_v
+                    best_py = (pk['y'] - oy) / dy_v
+            if best_px is not None:
+                return best_px, best_py
+        return self._find_peak(data_2d, px, py, search_r)
+
+    def _find_peak_3d_refined(self, px, py, z_idx, search_r, x_real, y_real):
+        """サブボクセル精緻化付きピーク検索。Returns (x_ang, y_ang, z_ang, log_str) in Å.
+
+        スナップ→粗最大値→選択アルゴリズムの順で処理する。"""
+        m = self.metadata
+        dx_v, dy_v, dz_v = m['voxel_size'][2], m['voxel_size'][1], m['voxel_size'][0]
+        ox, oy, oz = m['x_range'][0], m['y_range'][0], m['z_range'][0]
+        data_2d = self.volume[z_idx]
+
+        # スナップチェック (自動検出マーカーへのスナップ)
+        if (self.chk_snap_to_peaks.isChecked()
+                and self.detected_peaks
+                and self.chk_show_peak_markers.isChecked()):
+            snap_r_ang = search_r * min(dx_v, dy_v)
+            best_d = float('inf')
+            best_pk = None
+            for pk in self.detected_peaks:
+                d = np.hypot(pk['x'] - x_real, pk['y'] - y_real)
+                if d < snap_r_ang and d < best_d:
+                    best_d = d
+                    best_pk = pk
+            if best_pk is not None:
+                z_pk = best_pk.get('z', oz + z_idx * dz_v)
+                return best_pk['x'], best_pk['y'], z_pk, "snap"
+
+        # 粗最大値
+        ix_max, iy_max = _peak_find_coarse(data_2d, px, py, search_r)
+        coarse_log = f"coarse:({ix_max},{iy_max},{z_idx})"
+
+        refine_mode = self.combo_peak_refine.currentIndex()
+        fit_size = self.spin_fit_size.value()
+
+        if refine_mode == PEAK_REFINE_GAUSSIAN:
+            result = peak_refine_gaussian_3d(self.volume, z_idx, iy_max, ix_max, fit_size)
+            if result is None:
+                r = peak_refine_parabola_3d(self.volume, z_idx, iy_max, ix_max)
+                x_sub, y_sub, z_sub = r[0], r[1], r[2]
+                log = coarse_log + " → gauss_fail→" + r[3]
+            else:
+                x_sub, y_sub, z_sub = result[0], result[1], result[2]
+                log = coarse_log + " → " + result[6]
+        elif refine_mode == PEAK_REFINE_CENTROID:
+            r = peak_refine_centroid_3d(self.volume, z_idx, iy_max, ix_max, fit_size)
+            x_sub, y_sub, z_sub = r[0], r[1], r[2]
+            log = coarse_log + " → " + r[3]
+        else:  # PEAK_REFINE_PARABOLA
+            r = peak_refine_parabola_3d(self.volume, z_idx, iy_max, ix_max)
+            x_sub, y_sub, z_sub = r[0], r[1], r[2]
+            log = coarse_log + " → " + r[3]
+
+        x_ang = ox + x_sub * dx_v
+        y_ang = oy + y_sub * dy_v
+        z_ang = oz + z_sub * dz_v
+
+        if self.chk_fit_log.isChecked():
+            self.statusBar().showMessage(log)
+
+        return x_ang, y_ang, z_ang, log
+
+    def _on_fit_size_changed(self, val):
+        """フィット領域サイズを奇数に強制する。"""
+        if val % 2 == 0:
+            self.spin_fit_size.blockSignals(True)
+            self.spin_fit_size.setValue(val + 1)
+            self.spin_fit_size.blockSignals(False)
 
     def _on_canvas_click(self, x_real, y_real):
         if not self.measure_mode or self.volume is None:
@@ -1544,27 +2124,40 @@ class AtomViewerWindow(QMainWindow):
 
         m = self.metadata
         dx_v, dy_v = m['voxel_size'][2], m['voxel_size'][1]
+        dz_v = m['voxel_size'][0]
         ox, oy = m['x_range'][0], m['y_range'][0]
-        data_2d = self.volume[self.slider_z.value(), :, :]
+        oz = m['z_range'][0]
+        z_idx = self.slider_z.value()
+        data_2d = self.volume[z_idx, :, :]
+        z_real = oz + z_idx * dz_v
 
         px = (x_real - ox) / dx_v
         py = (y_real - oy) / dy_v
-
         search_r = self.spin_search_radius.value()
-        peak_px, peak_py = self._find_peak(data_2d, px, py, search_r)
 
-        peak_x = ox + peak_px * dx_v
-        peak_y = oy + peak_py * dy_v
+        if self.combo_peak_refine.currentIndex() == PEAK_REFINE_OFF:
+            peak_px, peak_py = self._snap_or_find_peak(
+                data_2d, px, py, search_r, x_real, y_real)
+            peak_x = ox + peak_px * dx_v
+            peak_y = oy + peak_py * dy_v
+            peak_z = z_real
+        else:
+            peak_x, peak_y, peak_z, _log = self._find_peak_3d_refined(
+                px, py, z_idx, search_r, x_real, y_real)
+            peak_px = (peak_x - ox) / dx_v
+            peak_py = (peak_y - oy) / dy_v
 
+        if self.measure_type == 'distance':
+            self._handle_distance_click(peak_x, peak_y, peak_px, peak_py)
+        else:
+            self._handle_angle_click(peak_x, peak_y, peak_px, peak_py, peak_z)
+
+    def _handle_distance_click(self, peak_x, peak_y, peak_px, peak_py):
+        """Process one click in 2-point distance mode."""
         point_num = len(self.click_points) + 1
         color = '#89b4fa' if point_num % 2 == 1 else '#f9e2af'
         self.canvas_xy.add_click_marker(peak_x, peak_y, f"P{point_num}", color)
-
-        self.click_points.append({
-            'x': peak_x, 'y': peak_y,
-            'px': peak_px, 'py': peak_py,
-        })
-
+        self.click_points.append({'x': peak_x, 'y': peak_y, 'px': peak_px, 'py': peak_py})
         self.lbl_click_info.setText(
             f"PT{point_num}  ({peak_x:.3f}, {peak_y:.3f}) Å  ·  px ({peak_px:.1f}, {peak_py:.1f})")
 
@@ -1574,13 +2167,11 @@ class AtomViewerWindow(QMainWindow):
             dist_text = f"{dist:.3f} Å"
             self.canvas_xy.add_distance_line(p1['x'], p1['y'], p2['x'], p2['y'], dist_text)
 
-            row = self.table_results.rowCount()
-            self.table_results.insertRow(row)
-            self.table_results.setItem(row, 0,
-                QTableWidgetItem(f"({p1['x']:.3f}, {p1['y']:.3f})"))
-            self.table_results.setItem(row, 1,
-                QTableWidgetItem(f"({p2['x']:.3f}, {p2['y']:.3f})"))
-            self.table_results.setItem(row, 2, QTableWidgetItem(dist_text))
+            row = self.table_dist.rowCount()
+            self.table_dist.insertRow(row)
+            self.table_dist.setItem(row, 0, QTableWidgetItem(f"({p1['x']:.3f}, {p1['y']:.3f})"))
+            self.table_dist.setItem(row, 1, QTableWidgetItem(f"({p2['x']:.3f}, {p2['y']:.3f})"))
+            self.table_dist.setItem(row, 2, QTableWidgetItem(dist_text))
 
             self.measurements.append({
                 'p1_x': p1['x'], 'p1_y': p1['y'],
@@ -1589,51 +2180,144 @@ class AtomViewerWindow(QMainWindow):
                 'p2_px': p2['px'], 'p2_py': p2['py'],
                 'distance': dist, 'plane': 'xy',
             })
-
             self.lbl_click_info.setText(
-                f"DIST  {dist_text}  ·  P1 ({p1['x']:.3f}, {p1['y']:.3f})  P2 ({p2['x']:.3f}, {p2['y']:.3f})")
+                f"DIST  {dist_text}  ·  P1 ({p1['x']:.3f}, {p1['y']:.3f})  "
+                f"P2 ({p2['x']:.3f}, {p2['y']:.3f})")
             self.statusBar().showMessage(f"距離測定: {dist_text}")
             self.click_points = []
 
+    def _handle_angle_click(self, peak_x, peak_y, peak_px, peak_py, z_real):
+        """Process one click in 3-point angle mode."""
+        _colors = ['#89b4fa', '#ff79c6', '#f9e2af']
+        _labels = ['A1', 'A2', 'A3']
+        n = len(self.click_points)
+        color, label = _colors[n % 3], _labels[n % 3]
+
+        self.canvas_xy.add_click_marker(peak_x, peak_y, label, color)
+        self.click_points.append({
+            'x': peak_x, 'y': peak_y, 'z': z_real,
+            'px': peak_px, 'py': peak_py,
+        })
+        self._update_measure_status_label()
+        self.lbl_click_info.setText(
+            f"{label}  ({peak_x:.3f}, {peak_y:.3f}, {z_real:.3f}) Å")
+
+        if len(self.click_points) >= 3:
+            p1, p2, p3 = self.click_points[-3], self.click_points[-2], self.click_points[-1]
+            angle_deg = self._calc_angle_3d(
+                (p1['x'], p1['y'], p1['z']),
+                (p2['x'], p2['y'], p2['z']),
+                (p3['x'], p3['y'], p3['z']),
+            )
+            d12 = np.sqrt((p2['x']-p1['x'])**2 + (p2['y']-p1['y'])**2 + (p2['z']-p1['z'])**2)
+            d23 = np.sqrt((p3['x']-p2['x'])**2 + (p3['y']-p2['y'])**2 + (p3['z']-p2['z'])**2)
+
+            self.canvas_xy.add_angle_lines(
+                p1['x'], p1['y'], p2['x'], p2['y'], p3['x'], p3['y'], angle_deg)
+
+            row = self.table_angle.rowCount()
+            self.table_angle.insertRow(row)
+            self.table_angle.setItem(row, 0, QTableWidgetItem(
+                f"({p1['x']:.3f}, {p1['y']:.3f}, {p1['z']:.3f})"))
+            self.table_angle.setItem(row, 1, QTableWidgetItem(
+                f"({p2['x']:.3f}, {p2['y']:.3f}, {p2['z']:.3f})"))
+            self.table_angle.setItem(row, 2, QTableWidgetItem(
+                f"({p3['x']:.3f}, {p3['y']:.3f}, {p3['z']:.3f})"))
+            self.table_angle.setItem(row, 3, QTableWidgetItem(f"{angle_deg:.1f}°"))
+            self.table_angle.setItem(row, 4, QTableWidgetItem(f"{d12:.3f}"))
+            self.table_angle.setItem(row, 5, QTableWidgetItem(f"{d23:.3f}"))
+
+            self.angle_measurements.append({
+                'p1_x': p1['x'], 'p1_y': p1['y'], 'p1_z': p1['z'],
+                'p1_px': p1['px'], 'p1_py': p1['py'],
+                'p2_x': p2['x'], 'p2_y': p2['y'], 'p2_z': p2['z'],
+                'p2_px': p2['px'], 'p2_py': p2['py'],
+                'p3_x': p3['x'], 'p3_y': p3['y'], 'p3_z': p3['z'],
+                'p3_px': p3['px'], 'p3_py': p3['py'],
+                'angle': angle_deg, 'd12': d12, 'd23': d23, 'plane': 'xy',
+            })
+            self.lbl_click_info.setText(
+                f"∠A1-A2-A3 = {angle_deg:.1f}°  |  d12={d12:.3f} Å  d23={d23:.3f} Å")
+            self.statusBar().showMessage(f"角度測定: {angle_deg:.1f}°")
+            self.click_points = []
+            self._update_measure_status_label()
+
+    @staticmethod
+    def _calc_angle_3d(p1, p2, p3):
+        """Compute ∠P1-P2-P3 in degrees (P2 is the vertex), using 3D vectors."""
+        v1 = np.array(p1) - np.array(p2)
+        v2 = np.array(p3) - np.array(p2)
+        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+        if n1 == 0 or n2 == 0:
+            return 0.0
+        cos_t = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
+        return float(np.degrees(np.arccos(cos_t)))
+
     def _redraw_measurements(self):
-        """スライス変更のたびに現在Zで再ピーク検出してマーカーを更新"""
+        """Re-detect peaks at current Z and redraw all measurement markers."""
         self.canvas_xy.clear_canvas_markers()
         if self.volume is None:
             return
 
         m = self.metadata
-        dx_v = m['voxel_size'][2]
-        dy_v = m['voxel_size'][1]
-        ox = m['x_range'][0]
-        oy = m['y_range'][0]
+        dx_v, dy_v = m['voxel_size'][2], m['voxel_size'][1]
+        ox, oy = m['x_range'][0], m['y_range'][0]
         data_2d = self.volume[self.slider_z.value(), :, :]
         search_r = self.spin_search_radius.value()
 
-        colors_p1 = '#89b4fa'
-        colors_p2 = '#f9e2af'
+        freeze = self.chk_freeze_markers.isChecked()
 
-        # 確定済み測定: 保存ピクセル座標を現在Zで再ピーク検出して再描画
+        # Confirmed distance measurements
         for i, meas in enumerate(self.measurements):
-            p1_px, p1_py = self._find_peak(data_2d, meas['p1_px'], meas['p1_py'], search_r)
-            p2_px, p2_py = self._find_peak(data_2d, meas['p2_px'], meas['p2_py'], search_r)
-            p1_x = ox + p1_px * dx_v
-            p1_y = oy + p1_py * dy_v
-            p2_x = ox + p2_px * dx_v
-            p2_y = oy + p2_py * dy_v
-            dist = np.sqrt((p2_x - p1_x) ** 2 + (p2_y - p1_y) ** 2)
-            self.canvas_xy.add_click_marker(p1_x, p1_y, f"P{i*2+1}", colors_p1)
-            self.canvas_xy.add_click_marker(p2_x, p2_y, f"P{i*2+2}", colors_p2)
+            if freeze:
+                p1_x, p1_y = meas['p1_x'], meas['p1_y']
+                p2_x, p2_y = meas['p2_x'], meas['p2_y']
+                dist = meas['distance']
+            else:
+                p1_px, p1_py = self._find_peak(data_2d, meas['p1_px'], meas['p1_py'], search_r)
+                p2_px, p2_py = self._find_peak(data_2d, meas['p2_px'], meas['p2_py'], search_r)
+                p1_x = ox + p1_px * dx_v; p1_y = oy + p1_py * dy_v
+                p2_x = ox + p2_px * dx_v; p2_y = oy + p2_py * dy_v
+                dist = np.sqrt((p2_x - p1_x)**2 + (p2_y - p1_y)**2)
+            self.canvas_xy.add_click_marker(p1_x, p1_y, f"P{i*2+1}", '#89b4fa')
+            self.canvas_xy.add_click_marker(p2_x, p2_y, f"P{i*2+2}", '#f9e2af')
             self.canvas_xy.add_distance_line(p1_x, p1_y, p2_x, p2_y, f"{dist:.3f} Å")
 
-        # 未確定の1点目も現在Zで再ピーク検出
+        # Confirmed angle measurements
+        for ameas in self.angle_measurements:
+            if freeze:
+                p1_x, p1_y = ameas['p1_x'], ameas['p1_y']
+                p2_x, p2_y = ameas['p2_x'], ameas['p2_y']
+                p3_x, p3_y = ameas['p3_x'], ameas['p3_y']
+                angle_deg = ameas['angle']
+            else:
+                p1_px, p1_py = self._find_peak(data_2d, ameas['p1_px'], ameas['p1_py'], search_r)
+                p2_px, p2_py = self._find_peak(data_2d, ameas['p2_px'], ameas['p2_py'], search_r)
+                p3_px, p3_py = self._find_peak(data_2d, ameas['p3_px'], ameas['p3_py'], search_r)
+                p1_x = ox + p1_px * dx_v; p1_y = oy + p1_py * dy_v
+                p2_x = ox + p2_px * dx_v; p2_y = oy + p2_py * dy_v
+                p3_x = ox + p3_px * dx_v; p3_y = oy + p3_py * dy_v
+                angle_deg = self._calc_angle_3d(
+                    (p1_x, p1_y, 0.0), (p2_x, p2_y, 0.0), (p3_x, p3_y, 0.0))
+            self.canvas_xy.add_angle_lines(p1_x, p1_y, p2_x, p2_y, p3_x, p3_y, angle_deg)
+
+        # In-progress clicks
+        _dist_colors = ['#89b4fa', '#f9e2af']
+        _angle_colors = ['#89b4fa', '#ff79c6', '#f9e2af']
+        _angle_labels = ['A1', 'A2', 'A3']
         for i, pt in enumerate(self.click_points):
-            new_px, new_py = self._find_peak(data_2d, pt['px'], pt['py'], search_r)
-            new_x = ox + new_px * dx_v
-            new_y = oy + new_py * dy_v
-            color = '#89b4fa' if i % 2 == 0 else '#f9e2af'
-            self.canvas_xy.add_click_marker(
-                new_x, new_y, f"P{len(self.measurements)*2+i+1}", color
-            )
+            if freeze:
+                new_x, new_y = pt['x'], pt['y']
+            else:
+                new_px, new_py = self._find_peak(data_2d, pt['px'], pt['py'], search_r)
+                new_x = ox + new_px * dx_v; new_y = oy + new_py * dy_v
+            if self.measure_type == 'distance':
+                color = _dist_colors[i % 2]
+                self.canvas_xy.add_click_marker(
+                    new_x, new_y, f"P{len(self.measurements)*2+i+1}", color)
+            else:
+                self.canvas_xy.add_click_marker(
+                    new_x, new_y, _angle_labels[i % 3], _angle_colors[i % 3])
 
         self.canvas_xy.draw_idle()
 
@@ -1671,20 +2355,60 @@ class AtomViewerWindow(QMainWindow):
             return (xx * sub).sum() / total, (yy * sub).sum() / total
         return float(peak_ix), float(peak_iy)
 
-    def _clear_measurements(self):
+    def _on_reset_dist(self):
+        """距離タブの選択リセット: 進行中選択 + 履歴 + マーカーを全クリア。"""
         self.click_points = []
         self.measurements = []
-        self.table_results.setRowCount(0)
+        self.table_dist.setRowCount(0)
         self.canvas_xy.clear_measurements()
+        self._redraw_measurements()
         self.lbl_click_info.setText("")
-        self.statusBar().showMessage("測定結果をクリアしました")
+        self.statusBar().showMessage("距離: 選択をリセットしました")
 
-    def _export_csv(self):
+    def _on_reset_angle(self):
+        """角度タブの選択リセット: 進行中選択 + 履歴 + マーカーを全クリア。"""
+        self.click_points = []
+        self.angle_measurements = []
+        self.table_angle.setRowCount(0)
+        self.canvas_xy.clear_measurements()
+        self._redraw_measurements()
+        self.lbl_click_info.setText("")
+        self.statusBar().showMessage("角度: 選択をリセットしました")
+
+    def _clear_current_tab(self):
+        """Clear measurements for the currently active results tab."""
+        tab_idx = self.tab_results.currentIndex()
+        if tab_idx == 0:
+            self.click_points = []
+            self.measurements = []
+            self.table_dist.setRowCount(0)
+            self.canvas_xy.clear_measurements()
+            self._redraw_measurements()
+            self.lbl_click_info.setText("")
+            self.statusBar().showMessage("距離測定履歴をクリアしました")
+        elif tab_idx == 1:
+            self.click_points = []
+            self.angle_measurements = []
+            self.table_angle.setRowCount(0)
+            self.canvas_xy.clear_measurements()
+            self._redraw_measurements()
+            self.lbl_click_info.setText("")
+            self.statusBar().showMessage("角度測定履歴をクリアしました")
+        else:
+            self.detected_peaks = []
+            self.table_peaks.setRowCount(0)
+            self.canvas_xy.clear_peak_markers()
+            self.canvas_xy.draw_idle()
+            self.statusBar().showMessage("検出ピークをクリアしました")
+
+    def _export_distance_csv(self):
         if not self.measurements:
-            QMessageBox.information(self, "情報", "エクスポートする測定結果がありません")
+            QMessageBox.information(self, "情報", "エクスポートする距離測定結果がありません")
             return
+        from datetime import datetime
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         filepath, _ = QFileDialog.getSaveFileName(
-            self, "CSVエクスポート", "measurements.csv", "CSV files (*.csv)")
+            self, "距離CSVエクスポート", f"distances_{ts}.csv", "CSV files (*.csv)")
         if not filepath:
             return
         try:
@@ -1694,9 +2418,189 @@ class AtomViewerWindow(QMainWindow):
                     f.write(f"{m['p1_x']:.4f},{m['p1_y']:.4f},"
                             f"{m['p2_x']:.4f},{m['p2_y']:.4f},"
                             f"{m['distance']:.4f},{m['plane']}\n")
-            self.statusBar().showMessage(f"CSVエクスポート完了: {filepath}")
+            self.statusBar().showMessage(f"距離CSVエクスポート完了: {filepath}")
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"エクスポート失敗:\n{str(e)}")
+
+    def _export_angle_csv(self):
+        if not self.angle_measurements:
+            QMessageBox.information(self, "情報", "エクスポートする角度測定結果がありません")
+            return
+        from datetime import datetime
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "角度CSVエクスポート", f"angles_{ts}.csv", "CSV files (*.csv)")
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'w', encoding='utf-8-sig') as f:
+                f.write("P1_X(Å),P1_Y(Å),P1_Z(Å),P2_X(Å),P2_Y(Å),P2_Z(Å),"
+                        "P3_X(Å),P3_Y(Å),P3_Z(Å),Angle(deg),d12(Å),d23(Å),Plane\n")
+                for a in self.angle_measurements:
+                    f.write(
+                        f"{a['p1_x']:.4f},{a['p1_y']:.4f},{a['p1_z']:.4f},"
+                        f"{a['p2_x']:.4f},{a['p2_y']:.4f},{a['p2_z']:.4f},"
+                        f"{a['p3_x']:.4f},{a['p3_y']:.4f},{a['p3_z']:.4f},"
+                        f"{a['angle']:.1f},{a['d12']:.4f},{a['d23']:.4f},{a['plane']}\n"
+                    )
+            self.statusBar().showMessage(f"角度CSVエクスポート完了: {filepath}")
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"エクスポート失敗:\n{str(e)}")
+
+    def _export_peaks_csv(self):
+        if not self.detected_peaks:
+            QMessageBox.information(self, "情報", "エクスポートする検出ピークがありません")
+            return
+        from datetime import datetime
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "ピークCSVエクスポート", f"peaks_{ts}.csv", "CSV files (*.csv)")
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'w', encoding='utf-8-sig') as f:
+                f.write("No.,X(Å),Y(Å),Z(Å),Intensity\n")
+                for i, pk in enumerate(self.detected_peaks):
+                    f.write(f"{i+1},{pk['x']:.4f},{pk['y']:.4f},{pk['z']:.4f},"
+                            f"{pk['intensity']:.6f}\n")
+            self.statusBar().showMessage(f"ピークCSVエクスポート完了: {filepath}")
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"エクスポート失敗:\n{str(e)}")
+
+
+    # -------------------------------------------------------------------------
+    # ピーク自動検出
+    # -------------------------------------------------------------------------
+    def _on_peak_range_changed(self, _checked):
+        """Enable/disable Z range spinboxes based on the selected range radio."""
+        enabled = self.radio_peak_zrange.isChecked()
+        self.spin_peak_z_start.setEnabled(enabled)
+        self.spin_peak_z_end.setEnabled(enabled)
+
+    def _on_detect_peaks(self):
+        if self.volume is None:
+            QMessageBox.information(self, "情報", "ボリュームデータを読み込んでから実行してください")
+            return
+
+        m = self.metadata
+        dz_v, dy_v, dx_v = m['voxel_size']
+        oz = m['z_range'][0]
+        percentile = self.spin_peak_percentile.value()
+        min_dist_ang = self.spin_peak_min_dist.value()
+        range_id = self.btn_grp_peak_range.checkedId()
+
+        if range_id == 0:
+            z_idx = self.slider_z.value()
+            volume_region = self.volume[z_idx:z_idx+1, :, :]
+            z_offset = z_idx
+        elif range_id == 1:
+            z_start = self.spin_peak_z_start.value()
+            z_end = self.spin_peak_z_end.value()
+            zi_start = max(0, int((z_start - oz) / dz_v))
+            zi_end = min(self.volume.shape[0], int((z_end - oz) / dz_v) + 1)
+            if zi_start >= zi_end:
+                QMessageBox.warning(self, "警告", "Z範囲が不正です (開始 ≥ 終了)")
+                return
+            volume_region = self.volume[zi_start:zi_end, :, :]
+            z_offset = zi_start
+        else:
+            volume_region = self.volume
+            z_offset = 0
+
+        if volume_region.size > 50_000_000:
+            self._start_peak_detection_thread(volume_region, z_offset, percentile, min_dist_ang)
+        else:
+            self._run_peak_detection_sync(volume_region, z_offset, percentile, min_dist_ang)
+
+    def _run_peak_detection_sync(self, volume_region, z_offset, percentile, min_dist_ang):
+        m = self.metadata
+        dz_v, dy_v, dx_v = m['voxel_size']
+        oz, oy, ox = m['z_range'][0], m['y_range'][0], m['x_range'][0]
+        filter_size = (
+            max(1, 2 * max(1, int(round(min_dist_ang / dz_v))) + 1),
+            max(1, 2 * max(1, int(round(min_dist_ang / dy_v))) + 1),
+            max(1, 2 * max(1, int(round(min_dist_ang / dx_v))) + 1),
+        )
+        vol = volume_region.astype(np.float32)
+        filtered = maximum_filter(vol, size=filter_size)
+        threshold = np.percentile(vol, percentile)
+        local_max = (vol == filtered) & (vol > threshold)
+        zz, yy, xx = np.where(local_max)
+
+        refine_mode = self.combo_peak_refine.currentIndex()
+        fit_size = self.spin_fit_size.value()
+        if len(zz) >= 100 and refine_mode != PEAK_REFINE_OFF:
+            self.statusBar().showMessage(f"ピーク精緻化中 ({len(zz)} 個)…")
+            QApplication.processEvents()
+
+        peaks = []
+        for zi, yi, xi in zip(zz, yy, xx):
+            abs_zi = int(zi) + z_offset
+            if refine_mode != PEAK_REFINE_OFF:
+                x_sub, y_sub, z_sub = _apply_peak_refinement_on_region(
+                    vol, int(zi), int(yi), int(xi), refine_mode, fit_size)
+                abs_z_sub = z_sub + z_offset
+            else:
+                x_sub, y_sub, abs_z_sub = float(xi), float(yi), float(abs_zi)
+            peaks.append({
+                'x': ox + x_sub * dx_v,
+                'y': oy + y_sub * dy_v,
+                'z': oz + abs_z_sub * dz_v,
+                'px': x_sub, 'py': y_sub, 'pz': abs_z_sub,
+                'intensity': float(vol[int(zi), int(yi), int(xi)]),
+            })
+        self.detected_peaks = peaks
+        self._populate_peaks_table()
+        self._update_peak_display()
+        self.statusBar().showMessage(f"ピーク検出完了: {len(peaks)} 個")
+
+    def _start_peak_detection_thread(self, volume_region, z_offset, percentile, min_dist_ang):
+        if self._peak_worker is not None and self._peak_worker.isRunning():
+            return
+        self.btn_detect_peaks.setEnabled(False)
+        self.statusBar().showMessage("ピーク検出中 (バックグラウンド)...")
+        self._peak_worker = PeakDetectionWorker(
+            volume_region, z_offset, self.metadata, percentile, min_dist_ang,
+            refine_mode=self.combo_peak_refine.currentIndex(),
+            fit_size=self.spin_fit_size.value())
+        self._peak_worker.finished.connect(self._on_peak_detection_done)
+        self._peak_worker.start()
+
+    def _on_peak_detection_done(self, peaks):
+        self.detected_peaks = peaks
+        self.btn_detect_peaks.setEnabled(True)
+        self._populate_peaks_table()
+        self._update_peak_display()
+        self.statusBar().showMessage(f"ピーク検出完了: {len(peaks)} 個")
+        self._peak_worker = None
+
+    def _populate_peaks_table(self):
+        self.table_peaks.setRowCount(0)
+        for i, pk in enumerate(self.detected_peaks):
+            row = self.table_peaks.rowCount()
+            self.table_peaks.insertRow(row)
+            self.table_peaks.setItem(row, 0, QTableWidgetItem(str(i + 1)))
+            self.table_peaks.setItem(row, 1, QTableWidgetItem(f"{pk['x']:.3f}"))
+            self.table_peaks.setItem(row, 2, QTableWidgetItem(f"{pk['y']:.3f}"))
+            self.table_peaks.setItem(row, 3, QTableWidgetItem(f"{pk['z']:.3f}"))
+            self.table_peaks.setItem(row, 4, QTableWidgetItem(f"{pk['intensity']:.4f}"))
+
+    def _update_peak_display(self):
+        """Refresh peak markers on the canvas based on visibility checkbox."""
+        if not self.chk_show_peak_markers.isChecked() or not self.detected_peaks:
+            self.canvas_xy.clear_peak_markers()
+            if self.detected_peaks:
+                self.canvas_xy.draw_idle()
+            return
+        peaks_xy = [(pk['x'], pk['y']) for pk in self.detected_peaks]
+        self.canvas_xy.draw_peak_markers(peaks_xy)
+
+    def _on_show_peaks_changed(self, state):
+        if state == Qt.Checked:
+            self._update_peak_display()
+        else:
+            self.canvas_xy.clear_peak_markers()
+            self.canvas_xy.draw_idle()
 
 
 # =============================================================================
@@ -1764,6 +2668,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
- 
-
