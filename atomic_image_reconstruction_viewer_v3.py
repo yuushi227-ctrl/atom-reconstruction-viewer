@@ -24,6 +24,7 @@ Atom Image Viewer - 原子像再構成ビューア (3D-AIR-IMAGE API対応版)
 
 import sys
 import os
+import functools
 import numpy as np
 from pathlib import Path
 
@@ -36,10 +37,10 @@ try:
         QTableWidgetItem, QHeaderView, QToolBar, QAction, QSizePolicy,
         QDialog, QListWidget, QDialogButtonBox, QProgressBar,
         QListWidgetItem, QScrollArea, QColorDialog,
-        QRadioButton, QButtonGroup, QTabWidget, QProgressDialog
+        QRadioButton, QButtonGroup, QTabWidget, QProgressDialog, QShortcut
     )
     from PyQt5.QtCore import Qt, pyqtSignal, QPointF, QThread, pyqtSlot
-    from PyQt5.QtGui import QFont, QColor, QIcon
+    from PyQt5.QtGui import QFont, QColor, QIcon, QKeySequence
 except ImportError:
     print("PyQt5が必要です: pip install PyQt5")
     sys.exit(1)
@@ -666,14 +667,15 @@ class AtomViewerWindow(QMainWindow):
         # データ
         self.volume = None
         self.metadata = None
-        self.atoms = []
+        self.atom_sets: list = []      # 読み込んだXYZセット一覧
+        self.active_atom_set_index: int = -1
         self.click_points = []
         self.measurements = []
         self.angle_measurements = []
         self.detected_peaks = []
         self.measure_type = 'distance'
         self._peak_worker = None
-        self.element_settings = {}   # {element: {'color': '#hex', 'radius': float}}
+        self.element_settings = {}   # 後方互換 (アクティブセットへの参照で上書き)
 
         self._build_ui()
         self._connect_signals()
@@ -946,15 +948,76 @@ class AtomViewerWindow(QMainWindow):
         sep.setStyleSheet("border-top: 1px solid #061828;")
         file_layout.addWidget(sep)
 
-        self.btn_load_xyz = QPushButton("XYZファイル読み込み")
+        self.btn_load_xyz = QPushButton("XYZ読み込み (複数可)")
         file_layout.addWidget(self.btn_load_xyz)
 
-        self.lbl_xyz_info = QLabel("— 未読み込み —")
+        self.list_xyz_files = QListWidget()
+        self.list_xyz_files.setMaximumHeight(120)
+        self.list_xyz_files.setStyleSheet(
+            "QListWidget { border: 1px solid #c8daea; border-radius: 4px; "
+            "font-size: 11px; background: #fff; color: #1a2a3a; }"
+            "QListWidget::item { padding: 3px 6px; }"
+            "QListWidget::item:selected { background: #cce8ff; color: #003a70; }"
+        )
+        file_layout.addWidget(self.list_xyz_files)
+
+        xyz_btn_row2 = QHBoxLayout()
+        self.btn_remove_xyz = QPushButton("削除")
+        self.btn_remove_xyz.setObjectName("danger")
+        self.btn_remove_xyz.setStyleSheet("font-size: 11px; padding: 4px 8px;")
+        self.btn_show_all_xyz = QPushButton("全表示")
+        self.btn_show_all_xyz.setStyleSheet("font-size: 11px; padding: 4px 8px;")
+        self.btn_hide_all_xyz = QPushButton("全非表示")
+        self.btn_hide_all_xyz.setStyleSheet("font-size: 11px; padding: 4px 8px;")
+        xyz_btn_row2.addWidget(self.btn_remove_xyz)
+        xyz_btn_row2.addWidget(self.btn_show_all_xyz)
+        xyz_btn_row2.addWidget(self.btn_hide_all_xyz)
+        file_layout.addLayout(xyz_btn_row2)
+
+        self.lbl_xyz_info = QLabel("読み込み済み: 0 / 表示中: 0")
         self.lbl_xyz_info.setStyleSheet("color: #90a8c0; font-size: 11px;")
+        self.lbl_xyz_info.setWordWrap(True)
         file_layout.addWidget(self.lbl_xyz_info)
 
         file_group.setLayout(file_layout)
         left_layout.addWidget(file_group)
+
+        # --- Atomオフセット (アクティブファイル) ---
+        offset_group = QGroupBox("▸ ATOM OFFSET (アクティブファイル)")
+        offset_layout = QGridLayout()
+        self.lbl_active_set_name = QLabel("編集中: —")
+        self.lbl_active_set_name.setStyleSheet(
+            "color: #0077b6; font-size: 11px; font-style: italic;")
+        offset_layout.addWidget(self.lbl_active_set_name, 0, 0, 1, 2)
+        offset_layout.addWidget(QLabel("X offset (Å):"), 1, 0)
+        self.spin_offset_x = QDoubleSpinBox()
+        self.spin_offset_x.setRange(-100.0, 100.0)
+        self.spin_offset_x.setDecimals(3)
+        self.spin_offset_x.setValue(0.0)
+        self.spin_offset_x.setSingleStep(0.05)
+        self.spin_offset_x.setEnabled(False)
+        offset_layout.addWidget(self.spin_offset_x, 1, 1)
+        offset_layout.addWidget(QLabel("Y offset (Å):"), 2, 0)
+        self.spin_offset_y = QDoubleSpinBox()
+        self.spin_offset_y.setRange(-100.0, 100.0)
+        self.spin_offset_y.setDecimals(3)
+        self.spin_offset_y.setValue(0.0)
+        self.spin_offset_y.setSingleStep(0.05)
+        self.spin_offset_y.setEnabled(False)
+        offset_layout.addWidget(self.spin_offset_y, 2, 1)
+        offset_layout.addWidget(QLabel("Z offset (Å):"), 3, 0)
+        self.spin_offset_z = QDoubleSpinBox()
+        self.spin_offset_z.setRange(-100.0, 100.0)
+        self.spin_offset_z.setDecimals(3)
+        self.spin_offset_z.setValue(0.0)
+        self.spin_offset_z.setSingleStep(0.05)
+        self.spin_offset_z.setEnabled(False)
+        offset_layout.addWidget(self.spin_offset_z, 3, 1)
+        self.btn_reset_offset = QPushButton("リセット (0, 0, 0)")
+        self.btn_reset_offset.setEnabled(False)
+        offset_layout.addWidget(self.btn_reset_offset, 4, 0, 1, 2)
+        offset_group.setLayout(offset_layout)
+        left_layout.addWidget(offset_group)
 
         # --- ボクセルサイズ ---
         voxel_group = QGroupBox("▸ VOXEL SIZE (Å)")
@@ -968,24 +1031,69 @@ class AtomViewerWindow(QMainWindow):
         left_layout.addWidget(voxel_group)
 
         # --- スライス制御 ---
-        slice_group = QGroupBox("▸ SLICE  Z-AXIS")
+        slice_group = QGroupBox("▸ SLICE (ホログラム表示位置)")
         slice_layout = QGridLayout()
 
-        slice_layout.addWidget(QLabel("XY平面 (Z):"), 0, 0)
+        slice_layout.addWidget(QLabel("Z (Å):"), 0, 0)
         self.slider_z = QSlider(Qt.Horizontal)
-        self.spin_z = QSpinBox()
+        self.spin_z = QDoubleSpinBox()
+        self.spin_z.setDecimals(3)
+        self.spin_z.setSingleStep(0.1)
+        self.spin_z.setRange(-9999.0, 9999.0)
         slice_layout.addWidget(self.slider_z, 0, 1)
         slice_layout.addWidget(self.spin_z, 0, 2)
 
-        slice_layout.addWidget(QLabel("Z原点 (slice):"), 1, 0)
-        self.spin_z_origin = QSpinBox()
-        self.spin_z_origin.setRange(0, 9999)
-        self.spin_z_origin.setValue(0)
-        self.spin_z_origin.setToolTip("この番号のスライスをZ=0・slice 0として表示します")
-        slice_layout.addWidget(self.spin_z_origin, 1, 1, 1, 2)
+        slice_layout.addWidget(QLabel("Y (Å):"), 1, 0)
+        self.slider_y = QSlider(Qt.Horizontal)
+        self.spin_y = QDoubleSpinBox()
+        self.spin_y.setDecimals(3)
+        self.spin_y.setSingleStep(0.1)
+        self.spin_y.setRange(-9999.0, 9999.0)
+        slice_layout.addWidget(self.slider_y, 1, 1)
+        slice_layout.addWidget(self.spin_y, 1, 2)
+
+        slice_layout.addWidget(QLabel("X (Å):"), 2, 0)
+        self.slider_x = QSlider(Qt.Horizontal)
+        self.spin_x = QDoubleSpinBox()
+        self.spin_x.setDecimals(3)
+        self.spin_x.setSingleStep(0.1)
+        self.spin_x.setRange(-9999.0, 9999.0)
+        slice_layout.addWidget(self.slider_x, 2, 1)
+        slice_layout.addWidget(self.spin_x, 2, 2)
 
         slice_group.setLayout(slice_layout)
         left_layout.addWidget(slice_group)
+
+        # --- クラスタースライス ---
+        cluster_group = QGroupBox("▸ CLUSTER SLICE (原子表示基準位置)")
+        cluster_layout = QGridLayout()
+
+        self.chk_cluster_link_hologram = QCheckBox("ホログラムに連動")
+        self.chk_cluster_link_hologram.setChecked(True)
+        cluster_layout.addWidget(self.chk_cluster_link_hologram, 0, 0, 1, 3)
+
+        self.spin_cluster_pos = {}
+        self.slider_cluster = {}
+        for _row_i, (_axis, _label) in enumerate(
+                [('z', 'Z (Å):'), ('y', 'Y (Å):'), ('x', 'X (Å):')], start=1):
+            cluster_layout.addWidget(QLabel(_label), _row_i, 0)
+            _sl = QSlider(Qt.Horizontal)
+            _sl.setEnabled(False)
+            _sp = QDoubleSpinBox()
+            _sp.setDecimals(3)
+            _sp.setSingleStep(0.1)
+            _sp.setRange(-9999.0, 9999.0)
+            _sp.setEnabled(False)
+            cluster_layout.addWidget(_sl, _row_i, 1)
+            cluster_layout.addWidget(_sp, _row_i, 2)
+            self.slider_cluster[_axis] = _sl
+            self.spin_cluster_pos[_axis] = _sp
+
+        self.btn_cluster_sync = QPushButton("現在のホログラム位置に合わせる")
+        cluster_layout.addWidget(self.btn_cluster_sync, 4, 0, 1, 3)
+
+        cluster_group.setLayout(cluster_layout)
+        left_layout.addWidget(cluster_group)
 
         # --- 表示設定 ---
         display_group = QGroupBox("▸ RENDER")
@@ -1004,30 +1112,6 @@ class AtomViewerWindow(QMainWindow):
         self.chk_show_atoms = QCheckBox("原子位置を表示")
         self.chk_show_atoms.setChecked(True)
         display_layout.addWidget(self.chk_show_atoms)
-
-        thick_row = QHBoxLayout()
-        thick_row.addWidget(QLabel("原子表示厚み (Å):"))
-        self.spin_atom_thickness = QDoubleSpinBox()
-        self.spin_atom_thickness.setRange(0.1, 50.0)
-        self.spin_atom_thickness.setValue(2.0)
-        self.spin_atom_thickness.setSingleStep(0.5)
-        thick_row.addWidget(self.spin_atom_thickness)
-        display_layout.addLayout(thick_row)
-
-        # クラスターZ位置 (ボリュームZとは独立)
-        cluster_z_row = QHBoxLayout()
-        cluster_z_row.addWidget(QLabel("クラスターZ (Å):"))
-        self.spin_cluster_z = QDoubleSpinBox()
-        self.spin_cluster_z.setRange(-1000.0, 1000.0)
-        self.spin_cluster_z.setDecimals(3)
-        self.spin_cluster_z.setValue(0.0)
-        self.spin_cluster_z.setSingleStep(0.1)
-        cluster_z_row.addWidget(self.spin_cluster_z)
-        display_layout.addLayout(cluster_z_row)
-
-        self.chk_link_cluster_z = QCheckBox("ボリュームZと連動")
-        self.chk_link_cluster_z.setChecked(False)
-        display_layout.addWidget(self.chk_link_cluster_z)
 
         display_group.setLayout(display_layout)
         left_layout.addWidget(display_group)
@@ -1101,6 +1185,11 @@ class AtomViewerWindow(QMainWindow):
         # --- 元素設定 ---
         elem_group = QGroupBox("▸ ELEMENTS")
         elem_outer_layout = QVBoxLayout()
+
+        self.lbl_active_elem_set = QLabel("編集中: —")
+        self.lbl_active_elem_set.setStyleSheet(
+            "color: #0077b6; font-size: 11px; font-style: italic;")
+        elem_outer_layout.addWidget(self.lbl_active_elem_set)
 
         # ヘッダー行
         hdr = QHBoxLayout()
@@ -1378,8 +1467,14 @@ class AtomViewerWindow(QMainWindow):
         right_layout.setSpacing(0)
 
         self.canvas_xy = SliceCanvas(title="XY平面 (Z固定)")
-        self.canvas_xy.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        right_layout.addWidget(self.canvas_xy, stretch=1)
+        self.canvas_xz = SliceCanvas(title="XZ平面 (Y固定)")
+        self.canvas_yz = SliceCanvas(title="YZ平面 (X固定)")
+
+        self.slice_tab = QTabWidget()
+        self.slice_tab.addTab(self.canvas_xy, "XY平面")
+        self.slice_tab.addTab(self.canvas_xz, "XZ平面")
+        self.slice_tab.addTab(self.canvas_yz, "YZ平面")
+        right_layout.addWidget(self.slice_tab, stretch=1)
 
         main_layout.addWidget(left_scroll)
         main_layout.addWidget(right_panel, stretch=1)
@@ -1427,10 +1522,14 @@ class AtomViewerWindow(QMainWindow):
         self.btn_load_xyz.clicked.connect(self._on_load_xyz)
         self.btn_apply_voxel.clicked.connect(self._on_apply_voxel)
 
-        self.slider_z.valueChanged.connect(self.spin_z.setValue)
-        self.spin_z.valueChanged.connect(self.slider_z.setValue)
-        self.spin_z.valueChanged.connect(lambda: self._update_slice())
-        self.spin_z_origin.valueChanged.connect(lambda: self._update_slice())
+        self.slider_z.valueChanged.connect(self._on_slider_z_changed)
+        self.spin_z.valueChanged.connect(self._on_spin_z_changed)
+
+        self.slider_y.valueChanged.connect(self._on_slider_y_changed)
+        self.spin_y.valueChanged.connect(self._on_spin_y_changed)
+
+        self.slider_x.valueChanged.connect(self._on_slider_x_changed)
+        self.spin_x.valueChanged.connect(self._on_spin_x_changed)
 
         self.combo_cmap.currentTextChanged.connect(self._update_all_slices)
         self.chk_auto_intensity.stateChanged.connect(self._on_auto_intensity_changed)
@@ -1441,9 +1540,14 @@ class AtomViewerWindow(QMainWindow):
         self.btn_intensity_from_slice.clicked.connect(self._on_intensity_from_slice)
         self.btn_intensity_from_volume.clicked.connect(self._on_intensity_from_volume)
         self.chk_show_atoms.stateChanged.connect(self._update_atom_overlay)
-        self.spin_atom_thickness.valueChanged.connect(self._update_atom_overlay)
-        self.spin_cluster_z.valueChanged.connect(self._update_atom_overlay)
-        self.chk_link_cluster_z.stateChanged.connect(self._on_link_cluster_z_changed)
+        self.slice_tab.currentChanged.connect(self._on_plane_tab_changed)
+        self.chk_cluster_link_hologram.toggled.connect(self._on_cluster_link_changed)
+        for _ax in ('x', 'y', 'z'):
+            self.slider_cluster[_ax].valueChanged.connect(
+                lambda idx, a=_ax: self._on_cluster_slider_changed(a, idx))
+            self.spin_cluster_pos[_ax].valueChanged.connect(
+                lambda ang, a=_ax: self._on_cluster_spin_axis_changed(a, ang))
+        self.btn_cluster_sync.clicked.connect(self._on_cluster_sync)
 
         self.btn_toggle_measure.toggled.connect(self._toggle_measure_mode)
         self.btn_clear_measure.clicked.connect(self._clear_current_tab)
@@ -1459,7 +1563,23 @@ class AtomViewerWindow(QMainWindow):
         self.radio_peak_zrange.toggled.connect(self._on_peak_range_changed)
         self.chk_freeze_markers.stateChanged.connect(lambda _: self._redraw_measurements())
 
-        self.canvas_xy.point_clicked.connect(lambda x, y: self._on_canvas_click(x, y))
+        self.btn_remove_xyz.clicked.connect(self._on_remove_xyz)
+        self.btn_show_all_xyz.clicked.connect(self._on_show_all_xyz)
+        self.btn_hide_all_xyz.clicked.connect(self._on_hide_all_xyz)
+        self.list_xyz_files.itemChanged.connect(self._on_xyz_list_item_changed)
+        self.list_xyz_files.currentRowChanged.connect(self._on_xyz_list_selection_changed)
+
+        self.spin_offset_x.valueChanged.connect(lambda v: self._on_offset_changed('x', v))
+        self.spin_offset_y.valueChanged.connect(lambda v: self._on_offset_changed('y', v))
+        self.spin_offset_z.valueChanged.connect(lambda v: self._on_offset_changed('z', v))
+        self.btn_reset_offset.clicked.connect(self._on_reset_offset)
+
+        self.canvas_xy.point_clicked.connect(
+            lambda x, y: self._on_canvas_click(x, y, plane='xy'))
+        self.canvas_xz.point_clicked.connect(
+            lambda x, y: self._on_canvas_click(x, y, plane='xz'))
+        self.canvas_yz.point_clicked.connect(
+            lambda x, y: self._on_canvas_click(x, y, plane='yz'))
 
     # -------------------------------------------------------------------------
     # API再接続
@@ -1487,19 +1607,19 @@ class AtomViewerWindow(QMainWindow):
     # ボリューム表示再描画 (データ再取得なし)
     # -------------------------------------------------------------------------
     def _on_redraw_volume(self):
-        """描画キャッシュクリア + ビューポートリセット + 現スライス再描画。
+        """描画キャッシュクリア + ビューポートリセット + 3平面再描画。
         データ・測定履歴は一切変更しない。"""
         if self.volume is None:
             self.statusBar().showMessage("ボリュームデータが未読み込みです")
             return
 
-        # ビューポートをextentに合わせてリセット
-        extent = self._get_extent('xy')
-        self.canvas_xy.ax.set_xlim(extent[0], extent[1])
-        self.canvas_xy.ax.set_ylim(extent[2], extent[3])
+        # 各キャンバスのビューポートをextentに合わせてリセット
+        for plane, canvas in [('xy', self.canvas_xy), ('xz', self.canvas_xz), ('yz', self.canvas_yz)]:
+            ext = self._get_extent(plane)
+            canvas.ax.set_xlim(ext[0], ext[1])
+            canvas.ax.set_ylim(ext[2], ext[3])
 
-        # 現スライスを再描画 (マーカー類も再描画される)
-        self._update_slice()
+        self._update_all_slices()
         self.statusBar().showMessage("ボリュームを再描画しました")
 
     # -------------------------------------------------------------------------
@@ -1707,21 +1827,58 @@ class AtomViewerWindow(QMainWindow):
         dy = self.spin_dy.value()
         dz = self.spin_dz.value()
 
-        # XY は中心原点（クラスターXYZ の座標系に合わせる）
-        # Z は 0 始まり（スライス番号との対応を保つ）
+        # X/Y/Z すべて中心原点（ボリューム中心 = 0 Å）
         self.metadata = {
             'voxel_size': (dz, dy, dx),
             'origin': (0.0, 0.0, 0.0),
             'x_range': (-nx * dx / 2, nx * dx / 2),
             'y_range': (-ny * dy / 2, ny * dy / 2),
-            'z_range': (0.0, nz * dz),
+            'z_range': (-nz * dz / 2, nz * dz / 2),
         }
 
         self.slider_z.setRange(0, nz - 1)
-        self.spin_z.setRange(0, nz - 1)
+        self.spin_z.setRange(self.metadata['z_range'][0], self.metadata['z_range'][1])
+        self.spin_z.setSingleStep(dz)
+        self.spin_z.blockSignals(True)
+        self.spin_z.setValue(0.0)
+        self.spin_z.blockSignals(False)
+        self.slider_z.blockSignals(True)
         self.slider_z.setValue(nz // 2)
-        self.spin_z_origin.setRange(0, nz - 1)
-        self.spin_z_origin.setValue(80 if nz > 80 else 0)
+        self.slider_z.blockSignals(False)
+
+        self.slider_y.setRange(0, ny - 1)
+        self.spin_y.setRange(self.metadata['y_range'][0], self.metadata['y_range'][1])
+        self.spin_y.setSingleStep(dy)
+        self.spin_y.blockSignals(True)
+        self.spin_y.setValue(0.0)
+        self.spin_y.blockSignals(False)
+        self.slider_y.blockSignals(True)
+        self.slider_y.setValue(ny // 2)
+        self.slider_y.blockSignals(False)
+
+        self.slider_x.setRange(0, nx - 1)
+        self.spin_x.setRange(self.metadata['x_range'][0], self.metadata['x_range'][1])
+        self.spin_x.setSingleStep(dx)
+        self.spin_x.blockSignals(True)
+        self.spin_x.setValue(0.0)
+        self.spin_x.blockSignals(False)
+        self.slider_x.blockSignals(True)
+        self.slider_x.setValue(nx // 2)
+        self.slider_x.blockSignals(False)
+
+        for _axis, _n, _d, _rk in [
+                ('z', nz, dz, 'z_range'), ('y', ny, dy, 'y_range'), ('x', nx, dx, 'x_range')]:
+            _sp = self.spin_cluster_pos[_axis]
+            _sp.blockSignals(True)
+            _sp.setRange(self.metadata[_rk][0], self.metadata[_rk][1])
+            _sp.setSingleStep(_d)
+            _sp.setValue(0.0)
+            _sp.blockSignals(False)
+            _sl = self.slider_cluster[_axis]
+            _sl.blockSignals(True)
+            _sl.setRange(0, _n - 1)
+            _sl.setValue(_n // 2)
+            _sl.blockSignals(False)
 
         self.lbl_volume_info.setText(
             f"サイズ: {nx}×{ny}×{nz}\n"
@@ -1743,38 +1900,151 @@ class AtomViewerWindow(QMainWindow):
         self.metadata['voxel_size'] = (dz, dy, dx)
         self.metadata['x_range'] = (-nx * dx / 2, nx * dx / 2)
         self.metadata['y_range'] = (-ny * dy / 2, ny * dy / 2)
-        self.metadata['z_range'] = (0.0, nz * dz)
+        self.metadata['z_range'] = (-nz * dz / 2, nz * dz / 2)
         self._update_all_slices()
         self.statusBar().showMessage(f"ボクセルサイズ更新: dx={dx}, dy={dy}, dz={dz} Å")
 
     # -------------------------------------------------------------------------
-    # XYZ読み込み
+    # XYZ読み込み・管理
     # -------------------------------------------------------------------------
     def _on_load_xyz(self):
-        filepath, _ = QFileDialog.getOpenFileName(
-            self, "XYZファイルを選択", "", "XYZ files (*.xyz);;All files (*)")
-        if not filepath:
+        filepaths, _ = QFileDialog.getOpenFileNames(
+            self, "XYZファイルを選択 (複数可)", "", "XYZ files (*.xyz);;All files (*)")
+        if not filepaths:
             return
-        try:
-            self.atoms = load_xyz(filepath)
-            if not self.atoms:
-                raise ValueError("原子データが見つかりませんでした（フォーマットを確認してください）")
-            z_vals = [a['z'] for a in self.atoms]
-            z_min, z_max = min(z_vals), max(z_vals)
-            median_z = float(np.median(z_vals))
-            # クラスターZをロードした原子のZ中央値に自動設定
-            self.spin_cluster_z.blockSignals(True)
-            self.spin_cluster_z.setValue(median_z)
-            self.spin_cluster_z.blockSignals(False)
-            self.lbl_xyz_info.setText(
-                f"{len(self.atoms)}個の原子 | {Path(filepath).name}\n"
-                f"Z範囲: {z_min:.2f} ～ {z_max:.2f} Å (中央: {median_z:.2f})"
-            )
-            self._rebuild_element_settings_ui()
+        added = 0
+        for fp in filepaths:
+            p = Path(fp)
+            if any(s['filepath'] == p for s in self.atom_sets):
+                continue
+            try:
+                atoms = load_xyz(str(p))
+                if not atoms:
+                    continue
+                elements = set(a['element'] for a in atoms)
+                atom_set = {
+                    'filepath': p,
+                    'name': p.stem,
+                    'atoms': atoms,
+                    'visible': True,
+                    'offset': [0.0, 0.0, 0.0],
+                    'element_colors': {e: get_element_color(e) for e in elements},
+                    'element_radii': {e: get_element_radius(e) for e in elements},
+                }
+                self.atom_sets.append(atom_set)
+                added += 1
+            except Exception as e:
+                self.statusBar().showMessage(f"読み込み失敗: {p.name}: {e}")
+        if added > 0:
+            self._rebuild_xyz_list_ui()
+            self.list_xyz_files.setCurrentRow(len(self.atom_sets) - 1)
             self._update_atom_overlay()
-            self.statusBar().showMessage(f"XYZ読み込み完了: {len(self.atoms)}個の原子")
-        except Exception as e:
-            QMessageBox.critical(self, "エラー", f"XYZ読み込み失敗:\n{str(e)}")
+            self.statusBar().showMessage(f"XYZ読み込み完了: {added}ファイル追加")
+        self._update_xyz_info_label()
+
+    def _rebuild_xyz_list_ui(self):
+        """atom_sets の内容に基づいて list_xyz_files を再構築する。"""
+        self.list_xyz_files.blockSignals(True)
+        self.list_xyz_files.clear()
+        for s in self.atom_sets:
+            item = QListWidgetItem(s['name'])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if s['visible'] else Qt.Unchecked)
+            self.list_xyz_files.addItem(item)
+        self.list_xyz_files.blockSignals(False)
+
+    def _on_xyz_list_item_changed(self, item):
+        """チェックボックス変更: visible を更新して再描画。"""
+        idx = self.list_xyz_files.row(item)
+        if 0 <= idx < len(self.atom_sets):
+            self.atom_sets[idx]['visible'] = (item.checkState() == Qt.Checked)
+            self._update_atom_overlay()
+            self._update_xyz_info_label()
+
+    def _on_xyz_list_selection_changed(self, row):
+        """リスト行選択: active_atom_set_index を更新して Element/Offset UI を切替。"""
+        if 0 <= row < len(self.atom_sets):
+            self.active_atom_set_index = row
+        else:
+            self.active_atom_set_index = -1
+        self._update_active_ui()
+
+    def _on_remove_xyz(self):
+        """選択中の XYZ セットを削除する。"""
+        row = self.list_xyz_files.currentRow()
+        if row < 0 or row >= len(self.atom_sets):
+            return
+        del self.atom_sets[row]
+        if self.active_atom_set_index >= len(self.atom_sets):
+            self.active_atom_set_index = len(self.atom_sets) - 1
+        self._rebuild_xyz_list_ui()
+        if self.active_atom_set_index >= 0:
+            self.list_xyz_files.setCurrentRow(self.active_atom_set_index)
+        self._update_active_ui()
+        self._update_atom_overlay()
+        self._update_xyz_info_label()
+
+    def _on_show_all_xyz(self):
+        for s in self.atom_sets:
+            s['visible'] = True
+        self._rebuild_xyz_list_ui()
+        self._update_atom_overlay()
+        self._update_xyz_info_label()
+
+    def _on_hide_all_xyz(self):
+        for s in self.atom_sets:
+            s['visible'] = False
+        self._rebuild_xyz_list_ui()
+        self._update_atom_overlay()
+        self._update_xyz_info_label()
+
+    def _update_xyz_info_label(self):
+        total = len(self.atom_sets)
+        visible = sum(1 for s in self.atom_sets if s['visible'])
+        self.lbl_xyz_info.setText(f"読み込み済み: {total} / 表示中: {visible}")
+
+    def _update_active_ui(self):
+        """active_atom_set_index に基づいて Element UI と Offset UI を更新する。"""
+        has_active = 0 <= self.active_atom_set_index < len(self.atom_sets)
+        name = self.atom_sets[self.active_atom_set_index]['name'] if has_active else "—"
+        self.lbl_active_set_name.setText(f"編集中: {name}")
+        self.lbl_active_elem_set.setText(f"編集中: {name}")
+        self.btn_reset_offset.setEnabled(has_active)
+        self._update_offset_axis_enabled()
+        if has_active:
+            off = self.atom_sets[self.active_atom_set_index]['offset']
+            self.spin_offset_x.blockSignals(True)
+            self.spin_offset_y.blockSignals(True)
+            self.spin_offset_z.blockSignals(True)
+            self.spin_offset_x.setValue(off[0])
+            self.spin_offset_y.setValue(off[1])
+            self.spin_offset_z.setValue(off[2])
+            self.spin_offset_x.blockSignals(False)
+            self.spin_offset_y.blockSignals(False)
+            self.spin_offset_z.blockSignals(False)
+        self._rebuild_element_settings_ui()
+
+    def _on_offset_changed(self, axis, value):
+        if not (0 <= self.active_atom_set_index < len(self.atom_sets)):
+            return
+        idx = {'x': 0, 'y': 1, 'z': 2}[axis]
+        self.atom_sets[self.active_atom_set_index]['offset'][idx] = value
+        self._update_atom_overlay()
+
+    def _on_reset_offset(self):
+        if not (0 <= self.active_atom_set_index < len(self.atom_sets)):
+            return
+        self.atom_sets[self.active_atom_set_index]['offset'] = [0.0, 0.0, 0.0]
+        self.spin_offset_x.blockSignals(True)
+        self.spin_offset_y.blockSignals(True)
+        self.spin_offset_z.blockSignals(True)
+        self.spin_offset_x.setValue(0.0)
+        self.spin_offset_y.setValue(0.0)
+        self.spin_offset_z.setValue(0.0)
+        self.spin_offset_x.blockSignals(False)
+        self.spin_offset_y.blockSignals(False)
+        self.spin_offset_z.blockSignals(False)
+        self._update_atom_overlay()
 
     # -------------------------------------------------------------------------
     # スライス更新
@@ -1789,34 +2059,86 @@ class AtomViewerWindow(QMainWindow):
             return [m['y_range'][0], m['y_range'][1], m['z_range'][0], m['z_range'][1]]
 
     def _update_slice(self):
+        """後方互換エイリアス。XYスライスのみ更新。"""
+        self._update_slice_xy()
+
+    def _update_slice_xy(self):
+        """XY平面 (Z固定) スライスを再描画する。"""
         if self.volume is None:
             return
         cmap = self.combo_cmap.currentText()
-        idx = self.slider_z.value()
+        z_pos = self.spin_z.value()
+        idx = self._angstrom_to_slice_idx('z', z_pos)
         data = self.volume[idx, :, :]
         extent = self._get_extent('xy')
-        dz = self.metadata['voxel_size'][0]
-        z_origin = self.spin_z_origin.value()
-        rel_idx = idx - z_origin          # 表示スライス番号（負も可）
-        z_pos = rel_idx * dz              # 表示Z座標（負も可）
         self.canvas_xy.ax.set_xlabel("X (Å)", color='#4a6880', fontsize=11)
         self.canvas_xy.ax.set_ylabel("Y (Å)", color='#4a6880', fontsize=11)
         self.canvas_xy.ax.set_title(
-            f"XY  ·  Z = {z_pos:+.3f} Å  ·  slice {rel_idx:+d}",
+            f"XY  ·  Z = {z_pos:+.3f} Å",
             color='#0077b6', fontsize=13, fontweight='bold')
         vmin, vmax = self._compute_vmin_vmax(data)
         self.canvas_xy.display_slice(data, extent, cmap, vmin=vmin, vmax=vmax)
-        # ボリュームZと連動している場合はクラスターZも更新
-        if self.chk_link_cluster_z.isChecked():
-            self.spin_cluster_z.blockSignals(True)
-            self.spin_cluster_z.setValue(z_pos)
-            self.spin_cluster_z.blockSignals(False)
-        self._update_atom_overlay_for_plane()
-        self._redraw_measurements()
-        self._update_peak_display()
+        if self.chk_cluster_link_hologram.isChecked():
+            self.spin_cluster_pos['z'].blockSignals(True)
+            self.spin_cluster_pos['z'].setValue(z_pos)
+            self.spin_cluster_pos['z'].blockSignals(False)
+        self._update_atom_overlay_for_plane('xy')
+        self._redraw_measurements_on_canvas('xy')
+        self._update_peak_display_on_canvas('xy')
+
+    def _update_slice_xz(self):
+        """XZ平面 (Y固定) スライスを再描画する。"""
+        if self.volume is None:
+            return
+        cmap = self.combo_cmap.currentText()
+        y_pos = self.spin_y.value()
+        iy = self._angstrom_to_slice_idx('y', y_pos)
+        data = self.volume[:, iy, :]   # shape (Nz, Nx); rows=Z, cols=X
+        extent = self._get_extent('xz')
+        self.canvas_xz.ax.set_xlabel("X (Å)", color='#4a6880', fontsize=11)
+        self.canvas_xz.ax.set_ylabel("Z (Å)", color='#4a6880', fontsize=11)
+        self.canvas_xz.ax.set_title(
+            f"XZ  ·  Y = {y_pos:+.3f} Å",
+            color='#0077b6', fontsize=13, fontweight='bold')
+        vmin, vmax = self._compute_vmin_vmax(data)
+        self.canvas_xz.display_slice(data, extent, cmap, vmin=vmin, vmax=vmax)
+        if self.chk_cluster_link_hologram.isChecked():
+            self.spin_cluster_pos['y'].blockSignals(True)
+            self.spin_cluster_pos['y'].setValue(y_pos)
+            self.spin_cluster_pos['y'].blockSignals(False)
+        self._update_atom_overlay_for_plane('xz')
+        self._redraw_measurements_on_canvas('xz')
+        self._update_peak_display_on_canvas('xz')
+
+    def _update_slice_yz(self):
+        """YZ平面 (X固定) スライスを再描画する。"""
+        if self.volume is None:
+            return
+        cmap = self.combo_cmap.currentText()
+        x_pos = self.spin_x.value()
+        ix = self._angstrom_to_slice_idx('x', x_pos)
+        data = self.volume[:, :, ix]   # shape (Nz, Ny); rows=Z, cols=Y
+        extent = self._get_extent('yz')
+        self.canvas_yz.ax.set_xlabel("Y (Å)", color='#4a6880', fontsize=11)
+        self.canvas_yz.ax.set_ylabel("Z (Å)", color='#4a6880', fontsize=11)
+        self.canvas_yz.ax.set_title(
+            f"YZ  ·  X = {x_pos:+.3f} Å",
+            color='#0077b6', fontsize=13, fontweight='bold')
+        vmin, vmax = self._compute_vmin_vmax(data)
+        self.canvas_yz.display_slice(data, extent, cmap, vmin=vmin, vmax=vmax)
+        if self.chk_cluster_link_hologram.isChecked():
+            self.spin_cluster_pos['x'].blockSignals(True)
+            self.spin_cluster_pos['x'].setValue(x_pos)
+            self.spin_cluster_pos['x'].blockSignals(False)
+        self._update_atom_overlay_for_plane('yz')
+        self._redraw_measurements_on_canvas('yz')
+        self._update_peak_display_on_canvas('yz')
 
     def _update_all_slices(self):
-        self._update_slice()
+        """3平面すべてを更新する。"""
+        self._update_slice_xy()
+        self._update_slice_xz()
+        self._update_slice_yz()
 
     # -------------------------------------------------------------------------
     # 強度調整
@@ -1851,7 +2173,7 @@ class AtomViewerWindow(QMainWindow):
     def _on_intensity_from_slice(self):
         if self.volume is None:
             return
-        data = self.volume[self.slider_z.value(), :, :]
+        data = self.volume[self._angstrom_to_slice_idx('z', self.spin_z.value()), :, :]
         self.chk_auto_intensity.setChecked(False)
         self.spin_vmin.blockSignals(True)
         self.spin_vmax.blockSignals(True)
@@ -1873,111 +2195,186 @@ class AtomViewerWindow(QMainWindow):
         self.spin_vmax.blockSignals(False)
         self._update_all_slices()
 
+    @property
+    def atoms(self):
+        """後方互換: アクティブセットの atoms を返す (なければ空リスト)。"""
+        if 0 <= self.active_atom_set_index < len(self.atom_sets):
+            return self.atom_sets[self.active_atom_set_index]['atoms']
+        return []
+
     # 原子オーバーレイ
     # -------------------------------------------------------------------------
-    def _update_atom_overlay(self):
-        self._update_atom_overlay_for_plane()
+    def _current_slice_pos_angstrom(self, axis: str) -> float:
+        """現在のスライス位置を Å 単位で返す (軸: 'x'/'y'/'z')。spin_z/y/x が Å 値を保持。"""
+        return {'z': self.spin_z, 'y': self.spin_y, 'x': self.spin_x}[axis].value()
 
-    def _update_atom_overlay_for_plane(self):
+    def _angstrom_to_slice_idx(self, axis: str, ang: float) -> int:
+        """Å座標を最寄りスライスインデックスに変換する。"""
+        d = self.metadata['voxel_size'][{'z': 0, 'y': 1, 'x': 2}[axis]]
+        n = self.volume.shape[{'z': 0, 'y': 1, 'x': 2}[axis]]
+        return max(0, min(n - 1, int(round(ang / d)) + n // 2))
+
+    def _current_cluster_pos_angstrom(self, axis: str) -> float:
+        """原子表示の基準位置を Å で返す。連動モードならホログラム位置、独立モードなら専用スピン値。"""
+        if self.chk_cluster_link_hologram.isChecked():
+            return self._current_slice_pos_angstrom(axis)
+        return self.spin_cluster_pos[axis].value()
+
+    def _on_plane_tab_changed(self, _idx):
+        """平面タブ切り替え時にオフセット軸の有効/無効を更新する。"""
+        self._update_offset_axis_enabled()
+
+    def _update_offset_axis_enabled(self):
+        """現在の平面タブと active_atom_set に応じてオフセット軸を有効/無効化する。
+        法線方向の軸のみ有効 (XY→Z, XZ→Y, YZ→X)。"""
+        has_active = 0 <= self.active_atom_set_index < len(self.atom_sets)
+        tab = self.slice_tab.currentIndex()  # 0=XY, 1=XZ, 2=YZ
+        self.spin_offset_x.setEnabled(has_active and tab == 2)
+        self.spin_offset_y.setEnabled(has_active and tab == 1)
+        self.spin_offset_z.setEnabled(has_active and tab == 0)
+
+    def _update_atom_overlay(self):
+        """3平面すべての原子オーバーレイを更新する。"""
+        for plane in ('xy', 'xz', 'yz'):
+            self._update_atom_overlay_for_plane(plane)
+
+    def _update_atom_overlay_for_plane(self, plane='xy'):
+        """指定平面のキャンバスに原子オーバーレイを描画する。
+        判定: 法線方向座標が |Δ| ≤ voxel_size/2 の原子のみ表示。
+        描画座標: 面内2軸のみ使用。法線方向オフセットは判定にのみ使う。"""
+        canvas = self._get_canvas(plane)
         if self.volume is None:
             return
-        self.canvas_xy.clear_atoms()
+        canvas.clear_atoms()
 
-        if not self.atoms or not self.chk_show_atoms.isChecked():
+        if not self.chk_show_atoms.isChecked() or not self.atom_sets:
             return
 
-        thickness = self.spin_atom_thickness.value()
-        cluster_z = self.spin_cluster_z.value()
+        m = self.metadata
         positions, colors, radii = [], [], []
 
-        for a in self.atoms:
-            if abs(a['z'] - cluster_z) <= thickness / 2:
-                elem = a['element']
-                s = self.element_settings.get(elem, {})
-                positions.append((a['x'], a['y']))
-                colors.append(s.get('color', get_element_color(elem)))
-                radii.append(s.get('radius', get_element_radius(elem)))
+        if plane == 'xy':
+            z_slice = self._current_cluster_pos_angstrom('z')
+            dz = m['voxel_size'][0]
+            for atom_set in self.atom_sets:
+                if not atom_set['visible']:
+                    continue
+                ox_off, oy_off, oz_off = atom_set['offset']
+                ec, er = atom_set['element_colors'], atom_set['element_radii']
+                for a in atom_set['atoms']:
+                    if abs((a['z'] + oz_off) - z_slice) <= dz / 2:
+                        elem = a['element']
+                        positions.append((a['x'] + ox_off, a['y'] + oy_off))
+                        colors.append(ec.get(elem, get_element_color(elem)))
+                        radii.append(er.get(elem, get_element_radius(elem)))
+
+        elif plane == 'xz':
+            y_slice = self._current_cluster_pos_angstrom('y')
+            dy = m['voxel_size'][1]
+            for atom_set in self.atom_sets:
+                if not atom_set['visible']:
+                    continue
+                ox_off, oy_off, oz_off = atom_set['offset']
+                ec, er = atom_set['element_colors'], atom_set['element_radii']
+                for a in atom_set['atoms']:
+                    if abs((a['y'] + oy_off) - y_slice) <= dy / 2:
+                        elem = a['element']
+                        positions.append((a['x'] + ox_off, a['z'] + oz_off))
+                        colors.append(ec.get(elem, get_element_color(elem)))
+                        radii.append(er.get(elem, get_element_radius(elem)))
+
+        elif plane == 'yz':
+            x_slice = self._current_cluster_pos_angstrom('x')
+            dx = m['voxel_size'][2]
+            for atom_set in self.atom_sets:
+                if not atom_set['visible']:
+                    continue
+                ox_off, oy_off, oz_off = atom_set['offset']
+                ec, er = atom_set['element_colors'], atom_set['element_radii']
+                for a in atom_set['atoms']:
+                    if abs((a['x'] + ox_off) - x_slice) <= dx / 2:
+                        elem = a['element']
+                        positions.append((a['y'] + oy_off, a['z'] + oz_off))
+                        colors.append(ec.get(elem, get_element_color(elem)))
+                        radii.append(er.get(elem, get_element_radius(elem)))
 
         if positions:
-            self.canvas_xy.overlay_atoms(positions, colors, radii)
+            canvas.overlay_atoms(positions, colors, radii)
 
     def _rebuild_element_settings_ui(self):
-        """XYZ読み込み後、検出元素ごとの色・半径設定行を再構築する"""
-        # 既存行を削除
+        """アクティブセットの元素ごとの色・半径設定行を再構築する。"""
         while self.elem_rows_layout.count():
             item = self.elem_rows_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        elements = sorted(set(a['element'] for a in self.atoms))
+        if not (0 <= self.active_atom_set_index < len(self.atom_sets)):
+            self.elem_rows_layout.addWidget(QLabel("XYZファイルを選択してください"))
+            return
+
+        atom_set = self.atom_sets[self.active_atom_set_index]
+        ec = atom_set['element_colors']
+        er = atom_set['element_radii']
+        elements = sorted(set(a['element'] for a in atom_set['atoms']))
         if not elements:
-            self.elem_rows_layout.addWidget(QLabel("XYZファイルを読み込んでください"))
+            self.elem_rows_layout.addWidget(QLabel("原子データがありません"))
             return
 
         for elem in elements:
-            if elem not in self.element_settings:
-                self.element_settings[elem] = {
-                    'color': get_element_color(elem),
-                    'radius': get_element_radius(elem),
-                }
-            s = self.element_settings[elem]
+            if elem not in ec:
+                ec[elem] = get_element_color(elem)
+            if elem not in er:
+                er[elem] = get_element_radius(elem)
 
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 1, 0, 1)
             row_layout.setSpacing(4)
 
-            # 元素名ラベル
             lbl = QLabel(elem)
             lbl.setFixedWidth(42)
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet(
-                f"font-weight: bold; color: {s['color']}; font-size: 12px;"
-            )
+                f"font-weight: bold; color: {ec[elem]}; font-size: 12px;")
             row_layout.addWidget(lbl)
 
-            # 色ボタン
             btn_color = QPushButton()
             btn_color.setFixedSize(52, 26)
             btn_color.setStyleSheet(
-                f"background-color: {s['color']}; border: 1px solid #45475a; border-radius: 3px;"
-            )
+                f"background-color: {ec[elem]}; border: 1px solid #45475a; border-radius: 3px;")
 
-            def _make_color_cb(e, btn, lbl_ref):
+            def _make_color_cb(e, btn, lbl_ref, aset):
                 def cb():
                     from PyQt5.QtGui import QColor as _QColor
-                    cur = _QColor(self.element_settings[e]['color'])
+                    cur = _QColor(aset['element_colors'][e])
                     c = QColorDialog.getColor(cur, self, f"{e} の色")
                     if c.isValid():
                         hex_c = c.name()
-                        self.element_settings[e]['color'] = hex_c
+                        aset['element_colors'][e] = hex_c
                         btn.setStyleSheet(
-                            f"background-color: {hex_c}; border: 1px solid #45475a; border-radius: 3px;"
-                        )
+                            f"background-color: {hex_c}; border: 1px solid #45475a; border-radius: 3px;")
                         lbl_ref.setStyleSheet(
-                            f"font-weight: bold; color: {hex_c}; font-size: 13px;"
-                        )
+                            f"font-weight: bold; color: {hex_c}; font-size: 13px;")
                         self._update_atom_overlay()
                 return cb
 
-            btn_color.clicked.connect(_make_color_cb(elem, btn_color, lbl))
+            btn_color.clicked.connect(_make_color_cb(elem, btn_color, lbl, atom_set))
             row_layout.addWidget(btn_color)
 
-            # 半径スピンボックス
             spin_r = QDoubleSpinBox()
             spin_r.setRange(0.01, 20.0)
             spin_r.setDecimals(2)
-            spin_r.setValue(s['radius'])
+            spin_r.setValue(er[elem])
             spin_r.setSingleStep(0.1)
             spin_r.setFixedWidth(76)
 
-            def _make_radius_cb(e):
+            def _make_radius_cb(e, aset):
                 def cb(val):
-                    self.element_settings[e]['radius'] = val
+                    aset['element_radii'][e] = val
                     self._update_atom_overlay()
                 return cb
 
-            spin_r.valueChanged.connect(_make_radius_cb(elem))
+            spin_r.valueChanged.connect(_make_radius_cb(elem, atom_set))
             row_layout.addWidget(spin_r)
             row_layout.addStretch()
 
@@ -1985,14 +2382,127 @@ class AtomViewerWindow(QMainWindow):
 
         self.elem_rows_layout.addStretch()
 
-    def _on_link_cluster_z_changed(self, state):
-        if state:
-            m = self.metadata
-            if m:
-                idx = self.slider_z.value()
-                z_pos = m['z_range'][0] + idx * m['voxel_size'][0]
-                self.spin_cluster_z.setValue(z_pos)
-        self._update_atom_overlay_for_plane()
+    def _on_cluster_link_changed(self, linked: bool):
+        """連動/独立モード切替: クラスタースピン/スライダーの有効無効とオーバーレイ更新。"""
+        for axis in ('x', 'y', 'z'):
+            self.spin_cluster_pos[axis].setEnabled(not linked)
+            self.slider_cluster[axis].setEnabled(not linked)
+        if linked and self.metadata:
+            for axis in ('x', 'y', 'z'):
+                ang = self._current_slice_pos_angstrom(axis)
+                self.spin_cluster_pos[axis].blockSignals(True)
+                self.spin_cluster_pos[axis].setValue(ang)
+                self.spin_cluster_pos[axis].blockSignals(False)
+                if self.volume is not None:
+                    d = self.metadata['voxel_size'][{'z': 0, 'y': 1, 'x': 2}[axis]]
+                    n = self.volume.shape[{'z': 0, 'y': 1, 'x': 2}[axis]]
+                    self.slider_cluster[axis].blockSignals(True)
+                    self.slider_cluster[axis].setValue(
+                        max(0, min(n - 1, int(round(ang / d)) + n // 2)))
+                    self.slider_cluster[axis].blockSignals(False)
+        self._update_atom_overlay()
+
+    def _on_cluster_sync(self):
+        """現在のホログラム位置をクラスタースピンにコピーする。"""
+        if self.metadata is None:
+            return
+        for axis in ('x', 'y', 'z'):
+            ang = self._current_slice_pos_angstrom(axis)
+            self.spin_cluster_pos[axis].blockSignals(True)
+            self.spin_cluster_pos[axis].setValue(ang)
+            self.spin_cluster_pos[axis].blockSignals(False)
+            if self.volume is not None:
+                d = self.metadata['voxel_size'][{'z': 0, 'y': 1, 'x': 2}[axis]]
+                n = self.volume.shape[{'z': 0, 'y': 1, 'x': 2}[axis]]
+                self.slider_cluster[axis].blockSignals(True)
+                self.slider_cluster[axis].setValue(
+                    max(0, min(n - 1, int(round(ang / d)) + n // 2)))
+                self.slider_cluster[axis].blockSignals(False)
+        if not self.chk_cluster_link_hologram.isChecked():
+            self._update_atom_overlay()
+
+    def _on_cluster_slider_changed(self, axis: str, idx: int):
+        """独立モードでクラスタースライダー変更時: スピンへ同期してオーバーレイ更新。"""
+        if self.volume is None:
+            return
+        d = self.metadata['voxel_size'][{'z': 0, 'y': 1, 'x': 2}[axis]]
+        n = self.volume.shape[{'z': 0, 'y': 1, 'x': 2}[axis]]
+        ang = (idx - n // 2) * d
+        self.spin_cluster_pos[axis].blockSignals(True)
+        self.spin_cluster_pos[axis].setValue(ang)
+        self.spin_cluster_pos[axis].blockSignals(False)
+        self._update_atom_overlay()
+
+    def _on_cluster_spin_axis_changed(self, axis: str, ang: float):
+        """独立モードでクラスタースピン変更時: スライダーへ同期してオーバーレイ更新。"""
+        if self.volume is None:
+            return
+        d = self.metadata['voxel_size'][{'z': 0, 'y': 1, 'x': 2}[axis]]
+        n = self.volume.shape[{'z': 0, 'y': 1, 'x': 2}[axis]]
+        self.slider_cluster[axis].blockSignals(True)
+        self.slider_cluster[axis].setValue(max(0, min(n - 1, int(round(ang / d)) + n // 2)))
+        self.slider_cluster[axis].blockSignals(False)
+        self._update_atom_overlay()
+
+    def _on_slider_z_changed(self, idx: int):
+        if self.volume is None:
+            return
+        dz = self.metadata['voxel_size'][0]
+        nz = self.volume.shape[0]
+        ang = (idx - nz // 2) * dz
+        self.spin_z.blockSignals(True)
+        self.spin_z.setValue(ang)
+        self.spin_z.blockSignals(False)
+        self._update_slice_xy()
+
+    def _on_spin_z_changed(self, ang: float):
+        if self.volume is None:
+            return
+        idx = self._angstrom_to_slice_idx('z', ang)
+        self.slider_z.blockSignals(True)
+        self.slider_z.setValue(idx)
+        self.slider_z.blockSignals(False)
+        self._update_slice_xy()
+
+    def _on_slider_y_changed(self, idx: int):
+        if self.volume is None:
+            return
+        dy = self.metadata['voxel_size'][1]
+        ny = self.volume.shape[1]
+        ang = (idx - ny // 2) * dy
+        self.spin_y.blockSignals(True)
+        self.spin_y.setValue(ang)
+        self.spin_y.blockSignals(False)
+        self._update_slice_xz()
+
+    def _on_spin_y_changed(self, ang: float):
+        if self.volume is None:
+            return
+        idx = self._angstrom_to_slice_idx('y', ang)
+        self.slider_y.blockSignals(True)
+        self.slider_y.setValue(idx)
+        self.slider_y.blockSignals(False)
+        self._update_slice_xz()
+
+    def _on_slider_x_changed(self, idx: int):
+        if self.volume is None:
+            return
+        dx = self.metadata['voxel_size'][2]
+        nx = self.volume.shape[2]
+        ang = (idx - nx // 2) * dx
+        self.spin_x.blockSignals(True)
+        self.spin_x.setValue(ang)
+        self.spin_x.blockSignals(False)
+        self._update_slice_yz()
+
+    def _on_spin_x_changed(self, ang: float):
+        if self.volume is None:
+            return
+        idx = self._angstrom_to_slice_idx('x', ang)
+        self.slider_x.blockSignals(True)
+        self.slider_x.setValue(idx)
+        self.slider_x.blockSignals(False)
+        self._update_slice_yz()
 
     # -------------------------------------------------------------------------
     # 距離測定
@@ -2022,11 +2532,16 @@ class AtomViewerWindow(QMainWindow):
             self.lbl_measure_mode.setStyleSheet(
                 "font-weight: bold; font-size: 11px; letter-spacing: 1px; color: #e08d3c;")
 
+    def _get_canvas(self, plane):
+        """平面名からキャンバスを返すヘルパー。"""
+        return {'xy': self.canvas_xy, 'xz': self.canvas_xz, 'yz': self.canvas_yz}[plane]
+
     def _on_measure_type_changed(self, _btn):
-        """Handle measurement type radio button change."""
+        """測定タイプ変更時: 進行中クリックと全キャンバスのマーカーをクリア。"""
         self.measure_type = 'angle' if self.radio_angle.isChecked() else 'distance'
         self.click_points = []
-        self.canvas_xy.clear_canvas_markers()
+        for canvas in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+            canvas.clear_canvas_markers()
         self._redraw_measurements()
         if self.measure_mode:
             self._update_measure_status_label()
@@ -2118,89 +2633,170 @@ class AtomViewerWindow(QMainWindow):
             self.spin_fit_size.setValue(val + 1)
             self.spin_fit_size.blockSignals(False)
 
-    def _on_canvas_click(self, x_real, y_real):
+    def _on_canvas_click(self, x_real, y_real, plane='xy'):
+        """canvas クリックを処理する。plane: 'xy'|'xz'|'yz'。"""
         if not self.measure_mode or self.volume is None:
             return
 
-        m = self.metadata
-        dx_v, dy_v = m['voxel_size'][2], m['voxel_size'][1]
-        dz_v = m['voxel_size'][0]
-        ox, oy = m['x_range'][0], m['y_range'][0]
-        oz = m['z_range'][0]
-        z_idx = self.slider_z.value()
-        data_2d = self.volume[z_idx, :, :]
-        z_real = oz + z_idx * dz_v
+        # 異なる平面のクリックが混在しないようにチェック
+        if self.click_points and self.click_points[0].get('plane') != plane:
+            self.statusBar().showMessage(
+                "警告: 異なる平面の測定点は混在できません。進行中の点をリセットします")
+            self.click_points = []
+            for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+                cv.clear_canvas_markers()
+            self._redraw_measurements()
+            return
 
-        px = (x_real - ox) / dx_v
-        py = (y_real - oy) / dy_v
+        m = self.metadata
+        dz_v, dy_v, dx_v = m['voxel_size']
+        ox, oy, oz = m['x_range'][0], m['y_range'][0], m['z_range'][0]
         search_r = self.spin_search_radius.value()
 
-        if self.combo_peak_refine.currentIndex() == PEAK_REFINE_OFF:
-            peak_px, peak_py = self._snap_or_find_peak(
-                data_2d, px, py, search_r, x_real, y_real)
-            peak_x = ox + peak_px * dx_v
-            peak_y = oy + peak_py * dy_v
-            peak_z = z_real
-        else:
-            peak_x, peak_y, peak_z, _log = self._find_peak_3d_refined(
-                px, py, z_idx, search_r, x_real, y_real)
-            peak_px = (peak_x - ox) / dx_v
-            peak_py = (peak_y - oy) / dy_v
+        if plane == 'xy':
+            z_idx = self.slider_z.value()
+            data_2d = self.volume[z_idx, :, :]
+            # キャンバスは (X, Y) Å; _peak_find_coarse は pixel 空間 (ix, iy)
+            px = (x_real - ox) / dx_v
+            py = (y_real - oy) / dy_v
+            if self.combo_peak_refine.currentIndex() == PEAK_REFINE_OFF:
+                peak_px, peak_py = self._snap_or_find_peak(
+                    data_2d, px, py, search_r, x_real, y_real)
+                peak_x = ox + peak_px * dx_v
+                peak_y = oy + peak_py * dy_v
+                peak_z = oz + z_idx * dz_v
+            else:
+                peak_x, peak_y, peak_z, _log = self._find_peak_3d_refined(
+                    px, py, z_idx, search_r, x_real, y_real)
+                peak_px = (peak_x - ox) / dx_v
+                peak_py = (peak_y - oy) / dy_v
+
+        elif plane == 'xz':
+            iy = self.slider_y.value()
+            # キャンバスは (X, Z) Å; data_2d[iz, ix]
+            data_2d = self.volume[:, iy, :]
+            px = (x_real - ox) / dx_v   # X pixel
+            pz = (y_real - oz) / dz_v   # Z pixel (canvas y-axis = Z)
+            # 粗最大値 → 3D精緻化
+            ix_max, iz_max = _peak_find_coarse(data_2d, px, pz, search_r)
+            refine_mode = self.combo_peak_refine.currentIndex()
+            fit_size = self.spin_fit_size.value()
+            if refine_mode == PEAK_REFINE_OFF:
+                x_sub, y_sub_v, z_sub = float(ix_max), float(iy), float(iz_max)
+                log = f"coarse:({ix_max},{iy},{iz_max})"
+            else:
+                x_sub, y_sub_v, z_sub = _apply_peak_refinement_on_region(
+                    self.volume, iz_max, iy, ix_max, refine_mode, fit_size)
+                log = f"xz_refine:({x_sub:.3f},{y_sub_v:.3f},{z_sub:.3f})"
+            if self.chk_fit_log.isChecked():
+                self.statusBar().showMessage(log)
+            peak_x = ox + x_sub * dx_v
+            peak_y = oy + y_sub_v * dy_v
+            peak_z = oz + z_sub * dz_v
+            peak_px = x_sub   # X pixel
+            peak_py = z_sub   # Z pixel (XZ平面では「py」にZ pixelを格納)
+
+        else:  # plane == 'yz'
+            ix = self.slider_x.value()
+            # キャンバスは (Y, Z) Å; data_2d[iz, iy]
+            data_2d = self.volume[:, :, ix]
+            py = (x_real - oy) / dy_v   # Y pixel (canvas x-axis = Y)
+            pz = (y_real - oz) / dz_v   # Z pixel
+            iy_max, iz_max = _peak_find_coarse(data_2d, py, pz, search_r)
+            refine_mode = self.combo_peak_refine.currentIndex()
+            fit_size = self.spin_fit_size.value()
+            if refine_mode == PEAK_REFINE_OFF:
+                x_sub_v, y_sub, z_sub = float(ix), float(iy_max), float(iz_max)
+                log = f"coarse:({ix},{iy_max},{iz_max})"
+            else:
+                x_sub_v, y_sub, z_sub = _apply_peak_refinement_on_region(
+                    self.volume, iz_max, iy_max, ix, refine_mode, fit_size)
+                log = f"yz_refine:({x_sub_v:.3f},{y_sub:.3f},{z_sub:.3f})"
+            if self.chk_fit_log.isChecked():
+                self.statusBar().showMessage(log)
+            peak_x = ox + x_sub_v * dx_v
+            peak_y = oy + y_sub * dy_v
+            peak_z = oz + z_sub * dz_v
+            peak_px = y_sub   # Y pixel
+            peak_py = z_sub   # Z pixel
 
         if self.measure_type == 'distance':
-            self._handle_distance_click(peak_x, peak_y, peak_px, peak_py)
+            self._handle_distance_click(peak_x, peak_y, peak_z, peak_px, peak_py, plane)
         else:
-            self._handle_angle_click(peak_x, peak_y, peak_px, peak_py, peak_z)
+            self._handle_angle_click(peak_x, peak_y, peak_z, peak_px, peak_py, plane)
 
-    def _handle_distance_click(self, peak_x, peak_y, peak_px, peak_py):
-        """Process one click in 2-point distance mode."""
+    def _handle_distance_click(self, peak_x, peak_y, peak_z, peak_px, peak_py, plane='xy'):
+        """2点距離モードのクリックを1回処理する。"""
+        canvas = self._get_canvas(plane)
         point_num = len(self.click_points) + 1
         color = '#89b4fa' if point_num % 2 == 1 else '#f9e2af'
-        self.canvas_xy.add_click_marker(peak_x, peak_y, f"P{point_num}", color)
-        self.click_points.append({'x': peak_x, 'y': peak_y, 'px': peak_px, 'py': peak_py})
+
+        # キャンバス上の表示座標 (plane によって軸の意味が違う)
+        cx, cy = self._to_canvas_coords(peak_x, peak_y, peak_z, plane)
+        canvas.add_click_marker(cx, cy, f"P{point_num}", color)
+        self.click_points.append({
+            'x': peak_x, 'y': peak_y, 'z': peak_z,
+            'px': peak_px, 'py': peak_py,
+            'cx': cx, 'cy': cy, 'plane': plane,
+        })
         self.lbl_click_info.setText(
-            f"PT{point_num}  ({peak_x:.3f}, {peak_y:.3f}) Å  ·  px ({peak_px:.1f}, {peak_py:.1f})")
+            f"PT{point_num}  ({peak_x:.3f}, {peak_y:.3f}, {peak_z:.3f}) Å")
 
         if len(self.click_points) >= 2:
             p1, p2 = self.click_points[-2], self.click_points[-1]
-            dist = np.sqrt((p2['x'] - p1['x'])**2 + (p2['y'] - p1['y'])**2)
+            # 平面内の投影距離
+            dist = np.sqrt((p2['cx'] - p1['cx'])**2 + (p2['cy'] - p1['cy'])**2)
             dist_text = f"{dist:.3f} Å"
-            self.canvas_xy.add_distance_line(p1['x'], p1['y'], p2['x'], p2['y'], dist_text)
+            canvas.add_distance_line(p1['cx'], p1['cy'], p2['cx'], p2['cy'], dist_text)
 
             row = self.table_dist.rowCount()
             self.table_dist.insertRow(row)
-            self.table_dist.setItem(row, 0, QTableWidgetItem(f"({p1['x']:.3f}, {p1['y']:.3f})"))
-            self.table_dist.setItem(row, 1, QTableWidgetItem(f"({p2['x']:.3f}, {p2['y']:.3f})"))
+            self.table_dist.setItem(row, 0, QTableWidgetItem(
+                f"({p1['x']:.3f}, {p1['y']:.3f}, {p1['z']:.3f})"))
+            self.table_dist.setItem(row, 1, QTableWidgetItem(
+                f"({p2['x']:.3f}, {p2['y']:.3f}, {p2['z']:.3f})"))
             self.table_dist.setItem(row, 2, QTableWidgetItem(dist_text))
 
             self.measurements.append({
-                'p1_x': p1['x'], 'p1_y': p1['y'],
+                'p1_x': p1['x'], 'p1_y': p1['y'], 'p1_z': p1['z'],
                 'p1_px': p1['px'], 'p1_py': p1['py'],
-                'p2_x': p2['x'], 'p2_y': p2['y'],
+                'p2_x': p2['x'], 'p2_y': p2['y'], 'p2_z': p2['z'],
                 'p2_px': p2['px'], 'p2_py': p2['py'],
-                'distance': dist, 'plane': 'xy',
+                'distance': dist, 'plane': plane,
             })
             self.lbl_click_info.setText(
-                f"DIST  {dist_text}  ·  P1 ({p1['x']:.3f}, {p1['y']:.3f})  "
-                f"P2 ({p2['x']:.3f}, {p2['y']:.3f})")
+                f"DIST  {dist_text}  ·  P1 ({p1['x']:.3f}, {p1['y']:.3f}, {p1['z']:.3f})  "
+                f"P2 ({p2['x']:.3f}, {p2['y']:.3f}, {p2['z']:.3f})")
             self.statusBar().showMessage(f"距離測定: {dist_text}")
             self.click_points = []
 
-    def _handle_angle_click(self, peak_x, peak_y, peak_px, peak_py, z_real):
-        """Process one click in 3-point angle mode."""
+    def _to_canvas_coords(self, x, y, z, plane):
+        """3D Å 座標を指定平面のキャンバス座標 (cx, cy) に変換する。"""
+        if plane == 'xy':
+            return x, y
+        elif plane == 'xz':
+            return x, z
+        else:  # 'yz'
+            return y, z
+
+    def _handle_angle_click(self, peak_x, peak_y, peak_z, peak_px, peak_py, plane='xy'):
+        """3点角度モードのクリックを1回処理する。"""
+        canvas = self._get_canvas(plane)
         _colors = ['#89b4fa', '#ff79c6', '#f9e2af']
         _labels = ['A1', 'A2', 'A3']
         n = len(self.click_points)
         color, label = _colors[n % 3], _labels[n % 3]
 
-        self.canvas_xy.add_click_marker(peak_x, peak_y, label, color)
+        cx, cy = self._to_canvas_coords(peak_x, peak_y, peak_z, plane)
+        canvas.add_click_marker(cx, cy, label, color)
         self.click_points.append({
-            'x': peak_x, 'y': peak_y, 'z': z_real,
+            'x': peak_x, 'y': peak_y, 'z': peak_z,
             'px': peak_px, 'py': peak_py,
+            'cx': cx, 'cy': cy, 'plane': plane,
         })
         self._update_measure_status_label()
         self.lbl_click_info.setText(
-            f"{label}  ({peak_x:.3f}, {peak_y:.3f}, {z_real:.3f}) Å")
+            f"{label}  ({peak_x:.3f}, {peak_y:.3f}, {peak_z:.3f}) Å")
 
         if len(self.click_points) >= 3:
             p1, p2, p3 = self.click_points[-3], self.click_points[-2], self.click_points[-1]
@@ -2212,8 +2808,8 @@ class AtomViewerWindow(QMainWindow):
             d12 = np.sqrt((p2['x']-p1['x'])**2 + (p2['y']-p1['y'])**2 + (p2['z']-p1['z'])**2)
             d23 = np.sqrt((p3['x']-p2['x'])**2 + (p3['y']-p2['y'])**2 + (p3['z']-p2['z'])**2)
 
-            self.canvas_xy.add_angle_lines(
-                p1['x'], p1['y'], p2['x'], p2['y'], p3['x'], p3['y'], angle_deg)
+            canvas.add_angle_lines(
+                p1['cx'], p1['cy'], p2['cx'], p2['cy'], p3['cx'], p3['cy'], angle_deg)
 
             row = self.table_angle.rowCount()
             self.table_angle.insertRow(row)
@@ -2234,7 +2830,7 @@ class AtomViewerWindow(QMainWindow):
                 'p2_px': p2['px'], 'p2_py': p2['py'],
                 'p3_x': p3['x'], 'p3_y': p3['y'], 'p3_z': p3['z'],
                 'p3_px': p3['px'], 'p3_py': p3['py'],
-                'angle': angle_deg, 'd12': d12, 'd23': d23, 'plane': 'xy',
+                'angle': angle_deg, 'd12': d12, 'd23': d23, 'plane': plane,
             })
             self.lbl_click_info.setText(
                 f"∠A1-A2-A3 = {angle_deg:.1f}°  |  d12={d12:.3f} Å  d23={d23:.3f} Å")
@@ -2254,43 +2850,55 @@ class AtomViewerWindow(QMainWindow):
         return float(np.degrees(np.arccos(cos_t)))
 
     def _redraw_measurements(self):
-        """Re-detect peaks at current Z and redraw all measurement markers."""
-        self.canvas_xy.clear_canvas_markers()
+        """全キャンバスの測定マーカーを再描画する (全平面一括版)。"""
+        for plane in ('xy', 'xz', 'yz'):
+            self._redraw_measurements_on_canvas(plane)
+
+    def _redraw_measurements_on_canvas(self, plane):
+        """指定平面のキャンバスの確定済み測定マーカーを再描画する。"""
+        canvas = self._get_canvas(plane)
+        canvas.clear_canvas_markers()
         if self.volume is None:
             return
 
         m = self.metadata
         dx_v, dy_v = m['voxel_size'][2], m['voxel_size'][1]
         ox, oy = m['x_range'][0], m['y_range'][0]
-        data_2d = self.volume[self.slider_z.value(), :, :]
-        search_r = self.spin_search_radius.value()
-
         freeze = self.chk_freeze_markers.isChecked()
 
-        # Confirmed distance measurements
+        # 確定済み距離測定
         for i, meas in enumerate(self.measurements):
-            if freeze:
-                p1_x, p1_y = meas['p1_x'], meas['p1_y']
-                p2_x, p2_y = meas['p2_x'], meas['p2_y']
-                dist = meas['distance']
-            else:
+            if meas.get('plane', 'xy') != plane:
+                continue
+            if plane == 'xy' and not freeze:
+                # XY のみ現スライスで再探索 (freeze=OFF 時)
+                data_2d = self.volume[self.slider_z.value(), :, :]
+                search_r = self.spin_search_radius.value()
                 p1_px, p1_py = self._find_peak(data_2d, meas['p1_px'], meas['p1_py'], search_r)
                 p2_px, p2_py = self._find_peak(data_2d, meas['p2_px'], meas['p2_py'], search_r)
                 p1_x = ox + p1_px * dx_v; p1_y = oy + p1_py * dy_v
                 p2_x = ox + p2_px * dx_v; p2_y = oy + p2_py * dy_v
                 dist = np.sqrt((p2_x - p1_x)**2 + (p2_y - p1_y)**2)
-            self.canvas_xy.add_click_marker(p1_x, p1_y, f"P{i*2+1}", '#89b4fa')
-            self.canvas_xy.add_click_marker(p2_x, p2_y, f"P{i*2+2}", '#f9e2af')
-            self.canvas_xy.add_distance_line(p1_x, p1_y, p2_x, p2_y, f"{dist:.3f} Å")
-
-        # Confirmed angle measurements
-        for ameas in self.angle_measurements:
-            if freeze:
-                p1_x, p1_y = ameas['p1_x'], ameas['p1_y']
-                p2_x, p2_y = ameas['p2_x'], ameas['p2_y']
-                p3_x, p3_y = ameas['p3_x'], ameas['p3_y']
-                angle_deg = ameas['angle']
+                c1x, c1y = p1_x, p1_y
+                c2x, c2y = p2_x, p2_y
             else:
+                # XZ/YZ は常に保存済みÅ座標から再描画 (freeze と同等)
+                c1x, c1y = self._to_canvas_coords(
+                    meas['p1_x'], meas['p1_y'], meas.get('p1_z', 0.0), plane)
+                c2x, c2y = self._to_canvas_coords(
+                    meas['p2_x'], meas['p2_y'], meas.get('p2_z', 0.0), plane)
+                dist = meas['distance']
+            canvas.add_click_marker(c1x, c1y, f"P{i*2+1}", '#89b4fa')
+            canvas.add_click_marker(c2x, c2y, f"P{i*2+2}", '#f9e2af')
+            canvas.add_distance_line(c1x, c1y, c2x, c2y, f"{dist:.3f} Å")
+
+        # 確定済み角度測定
+        for ameas in self.angle_measurements:
+            if ameas.get('plane', 'xy') != plane:
+                continue
+            if plane == 'xy' and not freeze:
+                data_2d = self.volume[self.slider_z.value(), :, :]
+                search_r = self.spin_search_radius.value()
                 p1_px, p1_py = self._find_peak(data_2d, ameas['p1_px'], ameas['p1_py'], search_r)
                 p2_px, p2_py = self._find_peak(data_2d, ameas['p2_px'], ameas['p2_py'], search_r)
                 p3_px, p3_py = self._find_peak(data_2d, ameas['p3_px'], ameas['p3_py'], search_r)
@@ -2299,27 +2907,43 @@ class AtomViewerWindow(QMainWindow):
                 p3_x = ox + p3_px * dx_v; p3_y = oy + p3_py * dy_v
                 angle_deg = self._calc_angle_3d(
                     (p1_x, p1_y, 0.0), (p2_x, p2_y, 0.0), (p3_x, p3_y, 0.0))
-            self.canvas_xy.add_angle_lines(p1_x, p1_y, p2_x, p2_y, p3_x, p3_y, angle_deg)
+                c1x, c1y = p1_x, p1_y
+                c2x, c2y = p2_x, p2_y
+                c3x, c3y = p3_x, p3_y
+            else:
+                c1x, c1y = self._to_canvas_coords(
+                    ameas['p1_x'], ameas['p1_y'], ameas['p1_z'], plane)
+                c2x, c2y = self._to_canvas_coords(
+                    ameas['p2_x'], ameas['p2_y'], ameas['p2_z'], plane)
+                c3x, c3y = self._to_canvas_coords(
+                    ameas['p3_x'], ameas['p3_y'], ameas['p3_z'], plane)
+                angle_deg = ameas['angle']
+            canvas.add_angle_lines(c1x, c1y, c2x, c2y, c3x, c3y, angle_deg)
 
-        # In-progress clicks
+        # 進行中クリック点 (plane が一致するもののみ)
         _dist_colors = ['#89b4fa', '#f9e2af']
         _angle_colors = ['#89b4fa', '#ff79c6', '#f9e2af']
         _angle_labels = ['A1', 'A2', 'A3']
         for i, pt in enumerate(self.click_points):
-            if freeze:
-                new_x, new_y = pt['x'], pt['y']
-            else:
+            if pt.get('plane') != plane:
+                continue
+            if plane == 'xy' and not freeze:
+                data_2d = self.volume[self.slider_z.value(), :, :]
+                search_r = self.spin_search_radius.value()
                 new_px, new_py = self._find_peak(data_2d, pt['px'], pt['py'], search_r)
-                new_x = ox + new_px * dx_v; new_y = oy + new_py * dy_v
+                new_cx = ox + new_px * dx_v
+                new_cy = oy + new_py * dy_v
+            else:
+                new_cx, new_cy = pt.get('cx', pt['x']), pt.get('cy', pt['y'])
             if self.measure_type == 'distance':
                 color = _dist_colors[i % 2]
-                self.canvas_xy.add_click_marker(
-                    new_x, new_y, f"P{len(self.measurements)*2+i+1}", color)
+                canvas.add_click_marker(
+                    new_cx, new_cy, f"P{len(self.measurements)*2+i+1}", color)
             else:
-                self.canvas_xy.add_click_marker(
-                    new_x, new_y, _angle_labels[i % 3], _angle_colors[i % 3])
+                canvas.add_click_marker(
+                    new_cx, new_cy, _angle_labels[i % 3], _angle_colors[i % 3])
 
-        self.canvas_xy.draw_idle()
+        canvas.draw_idle()
 
     def _find_peak(self, data_2d, px, py, search_radius):
         """クリック周辺のピークをサブピクセル精度で検出"""
@@ -2356,33 +2980,36 @@ class AtomViewerWindow(QMainWindow):
         return float(peak_ix), float(peak_iy)
 
     def _on_reset_dist(self):
-        """距離タブの選択リセット: 進行中選択 + 履歴 + マーカーを全クリア。"""
+        """距離タブの選択リセット: 全平面の進行中選択 + 履歴 + マーカーを全クリア。"""
         self.click_points = []
         self.measurements = []
         self.table_dist.setRowCount(0)
-        self.canvas_xy.clear_measurements()
+        for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+            cv.clear_measurements()
         self._redraw_measurements()
         self.lbl_click_info.setText("")
         self.statusBar().showMessage("距離: 選択をリセットしました")
 
     def _on_reset_angle(self):
-        """角度タブの選択リセット: 進行中選択 + 履歴 + マーカーを全クリア。"""
+        """角度タブの選択リセット: 全平面の進行中選択 + 履歴 + マーカーを全クリア。"""
         self.click_points = []
         self.angle_measurements = []
         self.table_angle.setRowCount(0)
-        self.canvas_xy.clear_measurements()
+        for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+            cv.clear_measurements()
         self._redraw_measurements()
         self.lbl_click_info.setText("")
         self.statusBar().showMessage("角度: 選択をリセットしました")
 
     def _clear_current_tab(self):
-        """Clear measurements for the currently active results tab."""
+        """現在アクティブな結果タブの測定をクリアする (3平面すべてに作用)。"""
         tab_idx = self.tab_results.currentIndex()
         if tab_idx == 0:
             self.click_points = []
             self.measurements = []
             self.table_dist.setRowCount(0)
-            self.canvas_xy.clear_measurements()
+            for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+                cv.clear_measurements()
             self._redraw_measurements()
             self.lbl_click_info.setText("")
             self.statusBar().showMessage("距離測定履歴をクリアしました")
@@ -2390,15 +3017,17 @@ class AtomViewerWindow(QMainWindow):
             self.click_points = []
             self.angle_measurements = []
             self.table_angle.setRowCount(0)
-            self.canvas_xy.clear_measurements()
+            for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+                cv.clear_measurements()
             self._redraw_measurements()
             self.lbl_click_info.setText("")
             self.statusBar().showMessage("角度測定履歴をクリアしました")
         else:
             self.detected_peaks = []
             self.table_peaks.setRowCount(0)
-            self.canvas_xy.clear_peak_markers()
-            self.canvas_xy.draw_idle()
+            for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+                cv.clear_peak_markers()
+                cv.draw_idle()
             self.statusBar().showMessage("検出ピークをクリアしました")
 
     def _export_distance_csv(self):
@@ -2413,10 +3042,10 @@ class AtomViewerWindow(QMainWindow):
             return
         try:
             with open(filepath, 'w', encoding='utf-8-sig') as f:
-                f.write("P1_X(Å),P1_Y(Å),P2_X(Å),P2_Y(Å),Distance(Å),Plane\n")
+                f.write("P1_X(Å),P1_Y(Å),P1_Z(Å),P2_X(Å),P2_Y(Å),P2_Z(Å),Distance(Å),Plane\n")
                 for m in self.measurements:
-                    f.write(f"{m['p1_x']:.4f},{m['p1_y']:.4f},"
-                            f"{m['p2_x']:.4f},{m['p2_y']:.4f},"
+                    f.write(f"{m['p1_x']:.4f},{m['p1_y']:.4f},{m.get('p1_z', 0.0):.4f},"
+                            f"{m['p2_x']:.4f},{m['p2_y']:.4f},{m.get('p2_z', 0.0):.4f},"
                             f"{m['distance']:.4f},{m['plane']}\n")
             self.statusBar().showMessage(f"距離CSVエクスポート完了: {filepath}")
         except Exception as e:
@@ -2586,21 +3215,34 @@ class AtomViewerWindow(QMainWindow):
             self.table_peaks.setItem(row, 4, QTableWidgetItem(f"{pk['intensity']:.4f}"))
 
     def _update_peak_display(self):
-        """Refresh peak markers on the canvas based on visibility checkbox."""
+        """3平面すべてのピークマーカーを更新する。"""
+        for plane in ('xy', 'xz', 'yz'):
+            self._update_peak_display_on_canvas(plane)
+
+    def _update_peak_display_on_canvas(self, plane):
+        """指定平面のキャンバスにピークマーカーを描画する。"""
+        canvas = self._get_canvas(plane)
         if not self.chk_show_peak_markers.isChecked() or not self.detected_peaks:
-            self.canvas_xy.clear_peak_markers()
+            canvas.clear_peak_markers()
             if self.detected_peaks:
-                self.canvas_xy.draw_idle()
+                canvas.draw_idle()
             return
-        peaks_xy = [(pk['x'], pk['y']) for pk in self.detected_peaks]
-        self.canvas_xy.draw_peak_markers(peaks_xy)
+        # 各平面の2D投影座標でマーカーを表示
+        if plane == 'xy':
+            peaks_2d = [(pk['x'], pk['y']) for pk in self.detected_peaks]
+        elif plane == 'xz':
+            peaks_2d = [(pk['x'], pk['z']) for pk in self.detected_peaks]
+        else:
+            peaks_2d = [(pk['y'], pk['z']) for pk in self.detected_peaks]
+        canvas.draw_peak_markers(peaks_2d)
 
     def _on_show_peaks_changed(self, state):
         if state == Qt.Checked:
             self._update_peak_display()
         else:
-            self.canvas_xy.clear_peak_markers()
-            self.canvas_xy.draw_idle()
+            for cv in (self.canvas_xy, self.canvas_xz, self.canvas_yz):
+                cv.clear_peak_markers()
+                cv.draw_idle()
 
 
 # =============================================================================
@@ -2610,23 +3252,27 @@ def generate_demo_data():
     print("デモデータ生成中...")
     nx = ny = nz = 80
     dx = dy = dz = 0.1
-    volume = np.zeros((nz, ny, nx), dtype=np.float32)
-    positions = [
+    cx0 = nx * dx / 2  # 中心原点オフセット = 4.0 Å
+    # ガウスブロブの絶対位置 (ピクセル計算用、0〜8 Å 空間)
+    abs_positions = [
         (4.0, 4.0, 4.0), (4.0, 2.0, 2.0), (2.0, 4.0, 2.0), (2.0, 2.0, 4.0),
         (0.0, 0.0, 0.0), (0.0, 4.0, 0.0), (4.0, 0.0, 0.0), (0.0, 0.0, 4.0),
         (6.0, 4.0, 2.0), (6.0, 2.0, 4.0), (2.0, 6.0, 4.0), (4.0, 6.0, 2.0),
     ]
+    volume = np.zeros((nz, ny, nx), dtype=np.float32)
     sigma = 3.0
-    for ax, ay, az in positions:
-        cx, cy, cz = ax/dx, ay/dy, az/dz
-        for zi in range(max(0,int(cz)-10), min(nz,int(cz)+11)):
-            for yi in range(max(0,int(cy)-10), min(ny,int(cy)+11)):
-                for xi in range(max(0,int(cx)-10), min(nx,int(cx)+11)):
-                    r2 = (xi-cx)**2 + (yi-cy)**2 + (zi-cz)**2
-                    volume[zi,yi,xi] += np.exp(-r2/(2*sigma**2))
+    for ax, ay, az in abs_positions:
+        pcx, pcy, pcz = ax/dx, ay/dy, az/dz
+        for zi in range(max(0, int(pcz)-10), min(nz, int(pcz)+11)):
+            for yi in range(max(0, int(pcy)-10), min(ny, int(pcy)+11)):
+                for xi in range(max(0, int(pcx)-10), min(nx, int(pcx)+11)):
+                    r2 = (xi-pcx)**2 + (yi-pcy)**2 + (zi-pcz)**2
+                    volume[zi, yi, xi] += np.exp(-r2/(2*sigma**2))
     volume += np.random.normal(0, 0.01, volume.shape).astype(np.float32)
     volume = np.clip(volume, 0, None)
-    atoms = [{'element':'Si','x':ax,'y':ay,'z':az} for ax,ay,az in positions]
+    # 原子座標を中心原点に変換 (絶対値 - 4.0 Å)
+    atoms = [{'element': 'Si', 'x': ax - cx0, 'y': ay - cx0, 'z': az - cx0}
+             for ax, ay, az in abs_positions]
     return volume, atoms
 
 
@@ -2657,8 +3303,21 @@ def main():
     if '--demo' in sys.argv:
         volume, atoms = generate_demo_data()
         window._set_volume_data(volume, "デモデータ (FCC Si)")
-        window.atoms = atoms
-        window.lbl_xyz_info.setText(f"デモ: {len(atoms)}個のSi原子")
+        elements = set(a['element'] for a in atoms)
+        demo_set = {
+            'filepath': None,
+            'name': 'デモ (FCC Si)',
+            'atoms': atoms,
+            'visible': True,
+            'offset': [0.0, 0.0, 0.0],
+            'element_colors': {e: get_element_color(e) for e in elements},
+            'element_radii': {e: get_element_radius(e) for e in elements},
+        }
+        window.atom_sets.append(demo_set)
+        window.active_atom_set_index = 0
+        window._rebuild_xyz_list_ui()
+        window._update_active_ui()
+        window._update_xyz_info_label()
         window._update_atom_overlay()
         window.statusBar().showMessage("デモモードで起動")
 
